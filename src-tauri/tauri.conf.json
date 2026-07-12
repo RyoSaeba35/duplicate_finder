@@ -1,0 +1,48 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev --prefix frontend",
+    "beforeBuildCommand": "npm run build --prefix frontend",
+    "devPath": "http://localhost:1420",
+    "distDir": "../frontend/dist"
+  },
+  "package": {
+    "productName": "Duplicate Finder",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "shell": {
+        "sidecar": true,
+        "scope": [
+          {
+            "name": "dupfinder_backend",
+            "sidecar": true
+          }
+        ]
+      },
+      "dialog": {
+        "open": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "com.yourname.dupfinder",
+      "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns", "icons/icon.ico"],
+      "targets": ["app", "dmg", "msi", "nsis"],
+      "externalBin": ["../backend/build/Release/dupfinder_backend"]
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "Duplicate Finder",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 500,
+        "resizable": true
+      }
+    ]
+  }
+}

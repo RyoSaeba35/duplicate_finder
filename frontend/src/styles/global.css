@@ -1,0 +1,66 @@
+/* Design tokens
+   Palette — near-black workspace, not the generic cream/terracotta AI default.
+   This is a technical/disk-inspection tool, so the palette reads "diagnostic
+   console" rather than "marketing page": deep charcoal panels, cool teal for
+   primary actions (data being read/kept), warm coral reserved *only* for
+   destructive actions (delete), so color itself signals risk level.
+*/
+:root {
+  --bg-base: #0e1013;
+  --bg-panel: #171a21;
+  --bg-panel-raised: #1e222b;
+  --border: #262b36;
+  --text-primary: #e7e9ee;
+  --text-secondary: #8b93a7;
+  --text-tertiary: #565d6e;
+  --accent-teal: #4fd1c5;
+  --accent-teal-dim: #2b6e68;
+  --accent-danger: #f0654a;
+  --accent-danger-dim: #7a3327;
+
+  --font-ui: -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Consolas, monospace;
+
+  --radius: 6px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent-teal);
+  outline-offset: 1px;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+.mono { font-family: var(--font-mono); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

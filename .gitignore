@@ -1,0 +1,23 @@
+# Build outputs
+backend/build/
+src-tauri/target/
+frontend/dist/
+frontend/build/
+
+# Dependencies
+frontend/node_modules/
+node_modules/
+
+# Rust
+**/*.rs.bk
+
+# Tauri
+src-tauri/target/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
