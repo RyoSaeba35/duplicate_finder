@@ -7,22 +7,36 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::api::process::{Command, CommandEvent};
-use tauri::Manager;
+use std::sync::{Arc, Mutex};
+use tauri::api::process::{Command, CommandChild, CommandEvent};
 
 fn main() {
-    tauri::Builder::default()
-        .setup(|app| {
+    // NOTE on a bug fixed here: the previous version tried to kill the
+    // sidecar from a single window's `WindowEvent::Destroyed` handler,
+    // looked up via `window.try_state()`. That's fragile — it only fires
+    // for that one window's destruction, and window-scoped state lookup
+    // isn't a reliable place to hang cleanup logic. This resulted in the
+    // backend process surviving after the window closed, which is exactly
+    // what caused an uninstall to fail with "Failed to kill Duplicate
+    // Finder" earlier — the old process was still running, invisibly,
+    // even with no window open. Fixed by hooking `RunEvent::Exit` /
+    // `ExitRequested` on the whole app instead, via `.build().run(...)`,
+    // which is the documented, reliable place to do last-chance cleanup
+    // regardless of *why* the app is exiting.
+    let child_handle: Arc<Mutex<Option<CommandChild>>> = Arc::new(Mutex::new(None));
+    let child_handle_for_setup = child_handle.clone();
+
+    let app = tauri::Builder::default()
+        .setup(move |_app| {
             let (mut rx, child) = Command::new_sidecar("dupfinder_backend")
                 .expect("failed to create sidecar command — did you build the C++ backend and name it per tauri.conf.json's externalBin?")
                 .spawn()
                 .expect("failed to spawn dupfinder_backend sidecar");
 
-            // Keep the child handle alive for the lifetime of the app by
-            // stashing it in managed state; forward stdout/stderr to the
-            // terminal for easier debugging during development.
-            app.manage(std::sync::Mutex::new(Some(child)));
+            *child_handle_for_setup.lock().unwrap() = Some(child);
 
+            // Forward the backend's stdout/stderr to this process's own
+            // console for easier debugging during development.
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = rx.recv().await {
                     match event {
@@ -38,20 +52,14 @@ fn main() {
 
             Ok(())
         })
-        .on_window_event(|event| {
-            // Make sure the backend process doesn't linger after the
-            // window closes.
-            if let tauri::WindowEvent::Destroyed = event.event() {
-                if let Some(state) = event
-                    .window()
-                    .try_state::<std::sync::Mutex<Option<tauri::api::process::CommandChild>>>()
-                {
-                    if let Some(child) = state.lock().unwrap().take() {
-                        let _ = child.kill();
-                    }
-                }
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(move |_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            if let Some(child) = child_handle.lock().unwrap().take() {
+                let _ = child.kill();
             }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        }
+    });
 }

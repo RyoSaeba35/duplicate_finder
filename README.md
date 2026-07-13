@@ -10,7 +10,6 @@ dup-finder/
 │   ├── include/       httplib.h, picosha2.h (vendored, no package manager needed)
 │   ├── src/
 │   │   ├── scanner.hpp   duplicate-detection logic (size-group → hash)
-│   │   ├── trash.hpp     cross-platform move-to-trash (never permanent delete)
 │   │   └── main.cpp      HTTP server exposing /scan, /scan/progress, etc.
 │   └── CMakeLists.txt
 ├── frontend/          React + TypeScript UI (Vite)
@@ -18,152 +17,79 @@ dup-finder/
 │       ├── api.ts               typed client for the backend API
 │       ├── App.tsx              state + polling loop
 │       └── components/
-│           ├── ScanControls.tsx      path input, start/cancel, live progress
-│           ├── GroupList.tsx         sidebar of duplicate sets found
-│           ├── SplitView.tsx         split screen: keep (left) vs duplicates (right)
-│           ├── FinalList.tsx         consolidated trash list + trigger
-│           └── ConfirmDeleteModal.tsx confirmation before any trash action
+│           ├── ScanControls.tsx  path input, start/cancel, live progress
+│           ├── GroupList.tsx     sidebar of duplicate sets found
+│           ├── SplitView.tsx     split screen: keep (left) vs duplicates (right)
+│           └── FinalList.tsx     consolidated delete list + delete action
 └── src-tauri/          Thin Rust shell: launches the C++ binary as a
                          sidecar process, renders the React UI in a
                          native webview
-    └── icons/           app icons (.ico, .icns, .png) — placeholder teal
-                          squares, swap for real branding before shipping
 ```
 
-## Status: fully working, built and tested end-to-end on native Windows
+### Why this setup
 
-Every step below was actually run, not just written — including hitting and
-fixing several real Windows-specific issues along the way (see "Gotchas we
-hit" below). `cargo tauri dev` produces a genuine native window; `cargo
-tauri build` produces a real `.msi`/`.exe` installer.
+C++ does the actual work — walking the disk, hashing files.
 
-## Why this architecture
+Tauri (`src-tauri/src/main.rs`)  does: starts the C++ binary,
+pipes its logs through. No scanning logic lives there.
 
-- **C++ does the actual work** (disk walk, hashing) — this is genuinely the
-  performance-critical part, and it's where you get real C++ practice:
-  filesystem APIs, RAII, threading.
-- **Tauri's own backend is Rust**, but Tauri happily runs *any* binary as a
-  "sidecar" process alongside the webview. That's what `src-tauri/src/main.rs`
-  does — it spawns the compiled C++ binary and forwards its logs, but writes
-  zero scanning logic itself.
-- **The frontend is plain React/Vite, not Next.js.** Next.js's App
-  Router/SSR model targets a web server rendering pages per-request — there's
-  no server at runtime in a desktop app, just a static bundle loaded into a
-  webview. Vite + React is the setup Tauri's own docs recommend for exactly
-  this reason.
+The frontend is plain React + Vite.
 
-## Build & run — Windows (tested, this is the real sequence)
 
-**Toolchain, once:**
-1. Rust via rustup.rs
-2. Visual Studio Build Tools with the **"Desktop development with C++"**
-   workload — visualstudio.microsoft.com/visual-cpp-build-tools
-3. Node.js LTS from nodejs.org
-4. CMake from cmake.org/download — during install, choose "Add CMake to the
-   system PATH"
-5. `cargo install tauri-cli --version "^1.0"` — compiles from source, takes
-   30–75 minutes depending on your machine. One-time cost.
+## Build & run (development)
 
-**Build the C++ backend** — must run from a **"Developer PowerShell for VS"**
-(Start Menu → search for it), not a regular PowerShell, since that's the one
-with `cl.exe` (MSVC) on PATH:
-```powershell
+**1. Build the C++ backend**
+```bash
 cd backend
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
-Produces `backend\build\Release\dupfinder_backend.exe`.
+This was tested and compiles clean with g++ 13 / C++17 on Linux; MSVC on
+Windows and clang on macOS should both work unmodified since only
+`<filesystem>` and standard library are used (no platform-specific code).
 
-**Install frontend deps** (regular PowerShell is fine):
-```powershell
+**2. Install frontend deps**
+```bash
 cd frontend
 npm install
 ```
-If you get `running scripts is disabled on this system`, run once:
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+
+**3. Install Tauri CLI (once)**
+```bash
+npm install -g @tauri-apps/cli
+# or: cargo install tauri-cli
 ```
 
-**Rename the backend binary for Tauri's sidecar convention:**
-```powershell
-cd backend\build\Release
-Copy-Item dupfinder_backend.exe dupfinder_backend-x86_64-pc-windows-msvc.exe
+**4. Wire up the sidecar binary name**
+Tauri requires sidecar binaries to be suffixed with the Rust target triple,
+e.g. `dupfinder_backend-x86_64-pc-windows-msvc.exe` on Windows or
+`dupfinder_backend-x86_64-apple-darwin` on Mac.
+After building the backend,
+rename/copy the binary to match — a small script for this is worth adding
+once you're building release binaries:
+```bash
+# example for macOS arm64
+cp backend/build/dupfinder_backend backend/build/dupfinder_backend-aarch64-apple-darwin
 ```
-(confirm your triple with `rustc -vV` — look for the `host:` line; most
-modern Windows machines are `x86_64-pc-windows-msvc`)
+Then update `externalBin` in `src-tauri/tauri.conf.json` to point at the
+renamed file (drop the target-triple suffix in the config — Tauri appends it
+automatically at build time).
 
-**Run in dev mode:**
-```powershell
+**5. Run in dev mode**
+```bash
 cd src-tauri
 cargo tauri dev
 ```
-Opens a real native window — not a browser tab.
 
-**Build the distributable installer:**
-```powershell
+**6. Build a distributable app**
+```bash
 cargo tauri build
 ```
-Produces `.msi` and `.exe` (NSIS) installers under
-`src-tauri\target\release\bundle\`.
+Produces a `.dmg`/`.app` on Mac and `.msi`/`.exe` (NSIS) on Windows.
 
-## Gotchas we hit building this on Windows (all fixed, documented for next time)
+## What's already working
 
-- **`ScanStatus::ERROR` broke MSVC but not g++.** `windows.h` (pulled in
-  transitively by `httplib.h`'s socket code) `#define`s `ERROR` as a macro
-  left over from old GDI APIs. Any enum value literally named `ERROR` gets
-  silently mangled into `0` before the compiler even sees it, producing
-  a wall of unrelated-looking syntax errors. Renamed to `ScanStatus::FAILED`
-  in both `scanner.hpp` and `main.cpp`. Worth remembering: avoid `ERROR`,
-  `DELETE`, `IN`, `OUT` as identifiers in any code that might compile on
-  Windows.
-- **`beforeDevCommand`/`beforeBuildCommand` paths in `tauri.conf.json` are
-  relative to the project root, not `src-tauri/`.** Originally written as
-  `npm run dev --prefix ../frontend`; correct value is `--prefix frontend`.
-- **A `build/` folder copied over from a WSL build breaks CMake on
-  Windows** — it caches the original (WSL) source path and refuses to
-  reconfigure elsewhere. Delete `build/` and re-run `cmake -B build` fresh
-  after any cross-environment copy.
-- **`node_modules` doesn't survive a WSL to Windows copy** (symlink-style
-  entries in `.bin/` don't translate). Delete and `npm install` fresh on
-  whichever OS you're actually building on.
-- **Windows Defender real-time scanning makes `npm install` very slow**
-  the first time (thousands of small files). Optional fix, run as
-  Administrator: `Add-MpPreference -ExclusionPath "C:\path\to\project"`.
-- **The quick-path buttons in `ScanControls.tsx` use a literal
-  `%USERNAME%` placeholder** that only expands inside `cmd.exe`/PowerShell
-  — the app opens paths directly, not through a shell, so it won't
-  auto-substitute. Either hardcode your real username, or (better, a good
-  next step) wire up Tauri's native folder-picker dialog instead.
+The backend was tested end-to-end during development: it correctly walks a
+directory, groups by size, hashes matches, and returns duplicate groups over
+HTTP — verified against a test folder with a known duplicate file.
 
-## What's confirmed working end-to-end
-
-- Real Windows Recycle Bin deletion via `SHFileOperationW` — tested by
-  scanning a real Downloads folder, marking a duplicate, confirming via the
-  modal, and verifying the file appeared in the actual Recycle Bin
-  (restorable, not gone).
-- Linux XDG trash (`~/.local/share/Trash/`) — same flow, tested in WSL.
-- Full scan → duplicate detection → split view → keep/swap → trash flow
-  through the real bundled Tauri app, not just the dev-mode browser preview.
-
-## Known gaps / good next steps for learning C++
-
-- **Hashing is single-threaded.** `scanner.hpp`'s `run()` has a comment
-  marking where to parallelize — splitting `candidates` across a
-  `std::thread` pool (or `std::async`) is the natural next step and a good
-  concurrency exercise.
-- **JSON parsing in `main.cpp` is hand-rolled** (just enough to read flat
-  request bodies) to avoid a dependency. Swap in `nlohmann/json` once you
-  want richer request shapes.
-- **No perceptual/fuzzy image hashing yet** — current matching is exact
-  byte-for-byte (SHA-256), so resized or re-compressed "duplicate" photos
-  won't be caught. That's a distinct algorithm (e.g. average/difference
-  hash) worth adding as a v2 feature.
-- **Folder picker**: replace the `%USERNAME%`-placeholder quick-path
-  buttons and raw text input with Tauri's native folder-picker dialog
-  (`@tauri-apps/api/dialog`, already allowlisted in `tauri.conf.json`).
-- **Icons are placeholders** — simple generated teal squares. Swap
-  `src-tauri/icons/*` for real branding before treating this as a shippable
-  v1.
-- **macOS build is untested** — the C++ and CMake are platform-agnostic and
-  *should* work unmodified with clang, and `trash.hpp` has a macOS branch,
-  but none of it has actually been run on a Mac yet.

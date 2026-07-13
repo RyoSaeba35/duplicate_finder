@@ -13,6 +13,7 @@
     "allowlist": {
       "shell": {
         "sidecar": true,
+        "open": "^((https?://)|(mailto:)|(tel:)|([a-zA-Z]:\\\\)|(/)).+",
         "scope": [
           {
             "name": "dupfinder_backend",

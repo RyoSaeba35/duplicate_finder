@@ -14,9 +14,16 @@
 //                          -> moves files to the OS trash/recycle bin
 //                             (never a permanent delete), returns
 //                             per-file success/failure
+//   GET  /files/preview?path=<path>
+//                          -> raw image bytes with correct Content-Type,
+//                             for rendering a thumbnail in the split view.
+//                             Images only, capped at 20MB; anything else
+//                             returns 415.
 
 #include <filesystem>
+#include <fstream>
 #include <sstream>
+#include <unordered_map>
 
 #include "httplib.h"
 #include "scanner.hpp"
@@ -85,7 +92,8 @@ std::string file_entry_to_json(const FileEntry& f) {
       << "\"filename\":\"" << json_escape(f.filename) << "\","
       << "\"size_bytes\":" << f.size_bytes << ","
       << "\"extension\":\"" << json_escape(f.extension) << "\","
-      << "\"is_image\":" << (is_image_ext(f.extension) ? "true" : "false")
+      << "\"is_image\":" << (is_image_ext(f.extension) ? "true" : "false") << ","
+      << "\"modified_unix\":" << f.modified_unix
       << "}";
     return j.str();
 }
@@ -111,10 +119,80 @@ std::string results_to_json(const std::vector<DuplicateGroup>& groups) {
     return j.str();
 }
 
+// Decodes a JSON string literal starting at the opening quote (body[pos]
+// must be '"'). Returns the decoded value and advances pos to just past
+// the closing quote. Shared by extract_json_string and the /files/delete
+// array parser so there's exactly one place that understands JSON escape
+// sequences, instead of two subtly-different copies.
+std::string decode_json_string_at(const std::string& body, size_t& pos) {
+    pos++; // move past the opening quote
+    std::string result;
+    while (pos < body.size() && body[pos] != '"') {
+        if (body[pos] == '\\' && pos + 1 < body.size()) {
+            char next = body[pos + 1];
+            switch (next) {
+                case '"':  result.push_back('"');  pos += 2; break;
+                case '\\': result.push_back('\\'); pos += 2; break;
+                case '/':  result.push_back('/');  pos += 2; break;
+                case 'n':  result.push_back('\n'); pos += 2; break;
+                case 't':  result.push_back('\t'); pos += 2; break;
+                case 'r':  result.push_back('\r'); pos += 2; break;
+                case 'b':  result.push_back('\b'); pos += 2; break;
+                case 'f':  result.push_back('\f'); pos += 2; break;
+                case 'u': {
+                    // Basic \uXXXX handling for the common case (BMP,
+                    // non-surrogate-pair code points — sufficient for the
+                    // file paths and filenames this API actually deals
+                    // with; a full surrogate-pair decoder is unnecessary
+                    // complexity here).
+                    if (pos + 5 < body.size()) {
+                        std::string hex = body.substr(pos + 2, 4);
+                        unsigned int code = 0;
+                        try { code = std::stoul(hex, nullptr, 16); } catch (...) {}
+                        if (code < 0x80) {
+                            result.push_back(static_cast<char>(code));
+                        } else if (code < 0x800) {
+                            result.push_back(static_cast<char>(0xC0 | (code >> 6)));
+                            result.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+                        } else {
+                            result.push_back(static_cast<char>(0xE0 | (code >> 12)));
+                            result.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+                            result.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+                        }
+                        pos += 6;
+                    } else {
+                        pos += 2;
+                    }
+                    break;
+                }
+                default:
+                    result.push_back(next);
+                    pos += 2;
+            }
+        } else {
+            result.push_back(body[pos]);
+            pos++;
+        }
+    }
+    if (pos < body.size()) pos++; // move past the closing quote
+    return result;
+}
+
 // Extremely small helper to pull a string/int field out of a flat JSON
 // object without a real parser. The frontend only ever sends flat,
 // single-level bodies, so this is sufficient and keeps the backend
 // dependency-free.
+//
+// IMPORTANT: this decodes standard JSON escape sequences via
+// decode_json_string_at rather than returning the raw substring between
+// quotes. Windows paths are full of backslashes, and JSON.stringify on
+// the frontend correctly escapes each one as "\\" — so without decoding
+// here, every path arrives with every backslash doubled. That happens to
+// still resolve for paths with something after the doubled separator
+// (Windows path normalization tolerates redundant separators in the
+// middle of a path), but silently fails for a bare drive root like "C:\"
+// (sent as "C:\\\\" in JSON, decodes to "C:\\", which is not a valid
+// root) — exactly the bug this fixes.
 std::string extract_json_string(const std::string& body, const std::string& key) {
     std::string needle = "\"" + key + "\"";
     auto pos = body.find(needle);
@@ -123,12 +201,7 @@ std::string extract_json_string(const std::string& body, const std::string& key)
     if (pos == std::string::npos) return "";
     pos = body.find('"', pos);
     if (pos == std::string::npos) return "";
-    auto end = body.find('"', pos + 1);
-    while (end != std::string::npos && body[end - 1] == '\\') {
-        end = body.find('"', end + 1);
-    }
-    if (end == std::string::npos) return "";
-    return body.substr(pos + 1, end - pos - 1);
+    return decode_json_string_at(body, pos);
 }
 
 uint64_t extract_json_number(const std::string& body, const std::string& key, uint64_t fallback) {
@@ -197,6 +270,71 @@ int main(int argc, char** argv) {
         res.set_content(results_to_json(g_scanner.results()), "application/json");
     });
 
+    // Serves raw image bytes for the split-view thumbnail. Deliberately
+    // narrow scope: only recognized image extensions, and capped at 20MB
+    // so a huge accidental match (e.g. a giant TIFF) can't stall the
+    // single-threaded httplib server on one request. Anything else — PDFs,
+    // videos, documents — isn't previewed inline; those get an "Open"
+    // link instead (handled entirely on the frontend via the OS's default
+    // application, no backend involvement needed).
+    svr.Get("/files/preview", [](const httplib::Request& req, httplib::Response& res) {
+        if (!req.has_param("path")) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing path parameter\"}", "application/json");
+            return;
+        }
+        // httplib decodes query parameters automatically.
+        std::string path = req.get_param_value("path");
+
+        std::error_code ec;
+        if (path.empty() || !fs::exists(path, ec) || ec) {
+            res.status = 404;
+            res.set_content("{\"error\":\"file not found\"}", "application/json");
+            return;
+        }
+
+        std::string ext = fs::path(path).extension().string();
+        for (auto& c : ext) c = static_cast<char>(tolower(c));
+        // Images render via <img>; PDFs render via WebView2's own built-in
+        // PDF viewer inside an <iframe> — same trick a normal Chromium
+        // browser uses for PDFs served over plain HTTP, no separate PDF
+        // rendering library needed on the backend. Everything else still
+        // falls back to the file-type badge on the frontend.
+        bool is_pdf = (ext == ".pdf");
+        if (!is_image_ext(ext) && !is_pdf) {
+            res.status = 415;
+            res.set_content("{\"error\":\"not a previewable file type\"}", "application/json");
+            return;
+        }
+
+        uint64_t size = fs::file_size(path, ec);
+        constexpr uint64_t kMaxPreviewBytes = 20ull * 1024 * 1024;
+        if (ec || size > kMaxPreviewBytes) {
+            res.status = 413;
+            res.set_content("{\"error\":\"file too large to preview\"}", "application/json");
+            return;
+        }
+
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            res.status = 500;
+            res.set_content("{\"error\":\"could not open file\"}", "application/json");
+            return;
+        }
+        std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+        static const std::unordered_map<std::string, std::string> mime_types = {
+            {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".png", "image/png"},
+            {".gif", "image/gif"}, {".bmp", "image/bmp"}, {".webp", "image/webp"},
+            {".svg", "image/svg+xml"}, {".tif", "image/tiff"}, {".tiff", "image/tiff"},
+            {".pdf", "application/pdf"},
+        };
+        auto it = mime_types.find(ext);
+        std::string content_type = it != mime_types.end() ? it->second : "application/octet-stream";
+
+        res.set_content(data, content_type);
+    });
+
     // Moves files the user picked in the UI to the OS trash/recycle bin —
     // never a permanent delete. Takes a flat JSON array of paths, e.g.
     // {"paths": ["C:\\a.jpg", "C:\\b.jpg"]}. Returns per-file success so a
@@ -211,10 +349,7 @@ int main(int argc, char** argv) {
         while (true) {
             pos = body.find('"', pos);
             if (pos == std::string::npos) break;
-            size_t end = body.find('"', pos + 1);
-            if (end == std::string::npos) break;
-            std::string candidate = body.substr(pos + 1, end - pos - 1);
-            pos = end + 1;
+            std::string candidate = decode_json_string_at(body, pos);
             if (candidate == "paths") continue; // skip the key itself
 
             std::string error_msg;

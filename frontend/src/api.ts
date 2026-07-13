@@ -9,6 +9,7 @@ export interface FileEntry {
   size_bytes: number;
   extension: string;
   is_image: boolean;
+  modified_unix: number;
 }
 
 export interface DuplicateGroup {
@@ -81,4 +82,15 @@ export function formatBytes(bytes: number): string {
     i++;
   }
   return `${val.toFixed(1)} ${units[i]}`;
+}
+
+export function formatModifiedDate(unixSeconds: number): string | null {
+  if (!unixSeconds) return null; // 0 means the backend couldn't read it
+  return new Date(unixSeconds * 1000).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }

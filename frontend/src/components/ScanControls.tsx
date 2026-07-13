@@ -10,11 +10,28 @@ interface Props {
   onCancel: () => void;
 }
 
-const COMMON_PATHS = [
-  { label: "C:\\ (whole drive)", value: "C:\\" },
-  { label: "Pictures", value: "C:\\Users\\%USERNAME%\\Pictures" },
-  { label: "Downloads", value: "C:\\Users\\%USERNAME%\\Downloads" },
-];
+// Only a real, literal path belongs here — no %USERNAME%-style
+// placeholders, since the app opens paths directly rather than through a
+// shell that would expand them. Everything else (Downloads, Pictures, any
+// folder) should go through the native folder-picker dialog below instead.
+const WHOLE_DRIVE = { label: "C:\\ (whole drive)", value: "C:\\" };
+
+async function pickFolder(): Promise<string | null> {
+  try {
+    // Dynamic import so this file still loads fine in the plain-browser
+    // dev preview (npm run dev in a regular tab) where the Tauri APIs
+    // aren't injected — it'll only actually be called from inside the
+    // real desktop app.
+    const { open } = await import("@tauri-apps/api/dialog");
+    const selected = await open({ directory: true, multiple: false });
+    return typeof selected === "string" ? selected : null;
+  } catch {
+    alert(
+      "The folder picker only works inside the installed desktop app, not the browser preview. Type the path manually here instead."
+    );
+    return null;
+  }
+}
 
 export default function ScanControls({
   path,
@@ -52,6 +69,23 @@ export default function ScanControls({
             padding: "8px 10px",
           }}
         />
+        <button
+          onClick={async () => {
+            const selected = await pickFolder();
+            if (selected) onPathChange(selected);
+          }}
+          disabled={scanning}
+          style={{
+            background: "var(--bg-panel-raised)",
+            color: "var(--text-primary)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius)",
+            padding: "8px 14px",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Browse…
+        </button>
         {!scanning ? (
           <button
             onClick={onStart}
@@ -85,23 +119,20 @@ export default function ScanControls({
       </div>
 
       <div style={{ display: "flex", gap: 6 }}>
-        {COMMON_PATHS.map((p) => (
-          <button
-            key={p.value}
-            onClick={() => onPathChange(p.value)}
-            disabled={scanning}
-            style={{
-              background: "transparent",
-              color: "var(--text-secondary)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius)",
-              padding: "4px 10px",
-              fontSize: 12,
-            }}
-          >
-            {p.label}
-          </button>
-        ))}
+        <button
+          onClick={() => onPathChange(WHOLE_DRIVE.value)}
+          disabled={scanning}
+          style={{
+            background: "transparent",
+            color: "var(--text-secondary)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius)",
+            padding: "4px 10px",
+            fontSize: 12,
+          }}
+        >
+          {WHOLE_DRIVE.label}
+        </button>
       </div>
 
       {progress && (
