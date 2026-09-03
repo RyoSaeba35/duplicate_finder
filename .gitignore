@@ -1,23 +1,7 @@
-# Build outputs
-backend/build/
-src-tauri/target/
-frontend/dist/
-frontend/build/
 
-# Dependencies
-frontend/node_modules/
-node_modules/
+# Development certificate
+devcert.pfx
 
-# Rust
-**/*.rs.bk
-
-# Tauri
-src-tauri/target/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-.vscode/
-.idea/
+dist/
+*.msix
+*.msixbundle

@@ -1,0 +1,10 @@
+^C:\USERS\JAZZ\DEV\DUPLICATE_FINDER\BACKEND\BUILD\CMAKEFILES\16F881D43F102F9A4D6218A5F0BB985F\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/Jazz/dev/duplicate_finder/backend -BC:/Users/Jazz/dev/duplicate_finder/backend/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/Jazz/dev/duplicate_finder/backend/build/dupfinder_backend.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

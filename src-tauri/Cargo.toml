@@ -1,27 +1,26 @@
 [package]
 name = "dup-finder"
-version = "0.1.0"
-description = "Duplicate file finder — C++ scan engine, React UI"
+version = "0.2.0"
+description = "Duplicate file finder — Rust scan engine, React UI"
 edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [ "shell-open", "shell-sidecar", "dialog-open", "devtools"] }
+tauri = { version = "1", features = [ "protocol-asset", "shell-open", "dialog-open", "devtools"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Used only for the Job Object cleanup mechanism in main.rs -- see the
-# comment on create_kill_on_close_job() there for why. Windows-only, so
-# it's kept out of the dependency tree entirely on other platforms.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
+sha2 = "0.10"
+trash = "3"
+walkdir = "2"
+ureq = { version = "2", features = ["json"] }
+
+# Parallel hashing — distributes SHA-256 work across all CPU cores.
+# The hashing pass is the bottleneck on large drives; rayon's work-stealing
+# thread pool handles it with no manual thread management needed.
+rayon = "1"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
