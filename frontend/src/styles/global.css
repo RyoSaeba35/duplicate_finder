@@ -1,27 +1,50 @@
 /* Design tokens
-   Palette — near-black workspace, not the generic cream/terracotta AI default.
-   This is a technical/disk-inspection tool, so the palette reads "diagnostic
-   console" rather than "marketing page": deep charcoal panels, cool teal for
-   primary actions (data being read/kept), warm coral reserved *only* for
-   destructive actions (delete), so color itself signals risk level.
+   Two themes, both toggleable at runtime via [data-theme] on <html>.
+   Every text color below is verified against WCAG AA (4.5:1 for normal
+   text) against the surfaces it's actually used on -- see the contrast
+   check this was built from. The previous dark theme's --text-tertiary
+   (#565d6e) only hit 2.64:1 against panels, well under AA; that's fixed
+   here, not just patched for light mode.
 */
-:root {
+:root,
+[data-theme="dark"] {
   --bg-base: #0e1013;
   --bg-panel: #171a21;
   --bg-panel-raised: #1e222b;
   --border: #262b36;
   --text-primary: #e7e9ee;
-  --text-secondary: #8b93a7;
-  --text-tertiary: #565d6e;
+  --text-secondary: #a3aabd;
+  --text-tertiary: #7d8494;
   --accent-teal: #4fd1c5;
   --accent-teal-dim: #2b6e68;
   --accent-danger: #f0654a;
   --accent-danger-dim: #7a3327;
+}
 
+[data-theme="light"] {
+  --bg-base: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-panel-raised: #eef0f3;
+  --border: #dde1e7;
+  --text-primary: #1a1d23;
+  --text-secondary: #454b5c;
+  --text-tertiary: #616773;
+  --accent-teal: #0e7a6f;
+  --accent-teal-dim: #cdeee9;
+  --accent-danger: #c23f26;
+  --accent-danger-dim: #f8ded7;
+}
+
+:root {
   --font-ui: -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Consolas, monospace;
-
   --radius: 6px;
+
+  /* Font size scale — set by FontSizeToggle.tsx via JS.
+     zoom scales the entire WebView uniformly, including all inline px
+     values in component styles, without needing to change any component.
+     Default 1 = medium (M). S = 0.88, L = 1.15. */
+  --ui-zoom: 1;
 }
 
 * { box-sizing: border-box; }
@@ -35,8 +58,10 @@ body {
   background: var(--bg-base);
   color: var(--text-primary);
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: 14px;
   -webkit-font-smoothing: antialiased;
+  transition: background 0.15s ease, color 0.15s ease;
+  zoom: var(--ui-zoom, 1);
 }
 
 button {
@@ -63,4 +88,45 @@ input:focus-visible {
 
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
+}
+
+/* ─── Scan progress bar ──────────────────────────────────────────────────────
+   Indeterminate sliding bar shown in ScanControls while a scan is running.
+*/
+.scanProgressBar {
+  height: 3px;
+  background: var(--bg-panel-raised);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.scanProgressBar__fill {
+  height: 100%;
+  width: 40%;
+  background: var(--accent-teal);
+  border-radius: 2px;
+  animation: scanSlide 1.4s ease-in-out infinite;
+}
+
+@keyframes scanSlide {
+  0%   { transform: translateX(-150%); }
+  100% { transform: translateX(400%); }
+}
+
+/* ─── Spinner ────────────────────────────────────────────────────────────────
+   Small rotating ring shown next to the "Scanning…" status text.
+*/
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--accent-teal-dim);
+  border-top-color: var(--accent-teal);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }

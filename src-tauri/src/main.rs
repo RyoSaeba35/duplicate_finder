@@ -1,65 +1,170 @@
-// main.rs — the Tauri shell is intentionally thin. Its only job is:
-//   1. launch the C++ backend binary as a sidecar when the app starts
-//   2. make sure that process is killed when the app closes
-//   3. render the React frontend in a native webview
-// All the actual duplicate-finding logic lives in the C++ backend, which
-// the frontend talks to directly over HTTP on 127.0.0.1:8721.
+// main.rs — the Tauri shell.
+//
+// App states:
+//   TrialActive  (licensed=false, expired=false) → full access
+//   FreeMode     (licensed=false, expired=true)  → scan + view free, deletion locked
+//   Licensed     (licensed=true)                 → full Pro access
+//
+// Scanning is allowed in all three states — the trial-expired gate that
+// used to block scans here has been removed. FreeMode users can scan
+// freely; only deletion is locked, and that gate lives on the React side
+// (SplitView lock icon + FinalList locked button + App.tsx guard).
+//
+// As of this version, NOTHING here spawns an external process at all.
+// trial_status, activate_license, delete_files, and start_scan/cancel_scan
+// all run natively in-process. The C++ backend (backend/, CMakeLists.txt,
+// scanner.hpp, etc.) is no longer part of the shipped app at all -- it
+// stays in the repo purely as the original portfolio/learning artifact.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::{Arc, Mutex};
-use tauri::api::process::{Command, CommandChild, CommandEvent};
+mod license;
+mod scanner;
+mod trial;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tauri::Manager;
+
+// Shared cancel flag for whichever scan is currently running. Reset to
+// false at the start of every new scan. Only one scan runs at a time (the
+// UI enforces that with its `scanning` state) -- if that assumption is
+// ever relaxed, this single shared flag would need to become per-scan.
+#[derive(Clone)]
+struct ScanState(Arc<AtomicBool>);
+
+#[tauri::command]
+fn start_scan(
+    app: tauri::AppHandle,
+    scan_state: tauri::State<'_, ScanState>,
+    request: String,
+) -> Result<(), String> {
+    let req: scanner::ScanRequest = serde_json::from_str(&request).map_err(|e| e.to_string())?;
+
+    // No trial/license gate here anymore. Scanning is free in all states
+    // (TrialActive, FreeMode, Licensed). Deletion is the gated feature,
+    // and that check lives in delete_files below + the React UI layer.
+
+    // Reset the shared cancel flag for this new scan.
+    scan_state.0.store(false, Ordering::Relaxed);
+    let cancel = scan_state.0.clone();
+    let app_handle = app.clone();
+
+    // Run on a dedicated OS thread, not the async runtime -- walking and
+    // hashing is real CPU/IO work and would otherwise block every other
+    // command while a scan is in progress.
+    std::thread::spawn(move || {
+        scanner::run_scan(
+            req.path,
+            req.min_size_kb * 1024,
+            req.options,
+            cancel,
+            |event| {
+                let _ = app_handle.emit_all("scan-event", &event);
+            },
+        );
+        let _ = app_handle.emit_all("scan-terminated", ());
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_scan(scan_state: tauri::State<'_, ScanState>) -> Result<(), String> {
+    scan_state.0.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+// Native, in-process trial status -- no subprocess spawn.
+#[tauri::command]
+fn trial_status() -> Result<trial::TrialStatus, String> {
+    let licensed = license::has_valid_saved_license();
+    Ok(trial::get_trial_status(licensed))
+}
+
+// License activation now involves ONE network call to Gumroad (see
+// license.rs for why). Kept as a plain, non-async command: Tauri runs
+// sync commands on its own thread pool, so this brief blocking call
+// doesn't freeze the UI.
+#[derive(serde::Serialize)]
+struct ActivateResult {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn activate_license(key: String) -> Result<ActivateResult, String> {
+    match license::activate(&key) {
+        license::ActivateOutcome::Activated => Ok(ActivateResult {
+            success: true,
+            error: None,
+        }),
+        license::ActivateOutcome::Rejected(msg) => Ok(ActivateResult {
+            success: false,
+            error: Some(msg),
+        }),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DeleteResult {
+    path: String,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+// Native, in-process delete via the `trash` crate.
+// Deletion is only reachable from the UI when licensed or in trial --
+// the React layer (App.tsx isFreeMode guard + FinalList + SplitView lock)
+// prevents FreeMode users from ever calling this. The check here is a
+// belt-and-suspenders safety net.
+#[tauri::command]
+fn delete_files(paths: Vec<String>) -> Result<Vec<DeleteResult>, String> {
+    let licensed = license::has_valid_saved_license();
+    let status = trial::get_trial_status(licensed);
+
+    // Block deletion in FreeMode at the Rust level as a safety net.
+    if !licensed && status.expired {
+        return Ok(paths
+            .into_iter()
+            .map(|path| DeleteResult {
+                path,
+                deleted: false,
+                error: Some("deletion requires a license — upgrade at pierrecode.gumroad.com/l/byzsj".to_string()),
+            })
+            .collect());
+    }
+
+    let results = paths
+        .into_iter()
+        .map(|path| match trash::delete(&path) {
+            Ok(()) => DeleteResult {
+                path,
+                deleted: true,
+                error: None,
+            },
+            Err(e) => DeleteResult {
+                path,
+                deleted: false,
+                error: Some(e.to_string()),
+            },
+        })
+        .collect();
+    Ok(results)
+}
 
 fn main() {
-    // NOTE on a bug fixed here: the previous version tried to kill the
-    // sidecar from a single window's `WindowEvent::Destroyed` handler,
-    // looked up via `window.try_state()`. That's fragile — it only fires
-    // for that one window's destruction, and window-scoped state lookup
-    // isn't a reliable place to hang cleanup logic. This resulted in the
-    // backend process surviving after the window closed, which is exactly
-    // what caused an uninstall to fail with "Failed to kill Duplicate
-    // Finder" earlier — the old process was still running, invisibly,
-    // even with no window open. Fixed by hooking `RunEvent::Exit` /
-    // `ExitRequested` on the whole app instead, via `.build().run(...)`,
-    // which is the documented, reliable place to do last-chance cleanup
-    // regardless of *why* the app is exiting.
-    let child_handle: Arc<Mutex<Option<CommandChild>>> = Arc::new(Mutex::new(None));
-    let child_handle_for_setup = child_handle.clone();
-
-    let app = tauri::Builder::default()
-        .setup(move |_app| {
-            let (mut rx, child) = Command::new_sidecar("dupfinder_backend")
-                .expect("failed to create sidecar command — did you build the C++ backend and name it per tauri.conf.json's externalBin?")
-                .spawn()
-                .expect("failed to spawn dupfinder_backend sidecar");
-
-            *child_handle_for_setup.lock().unwrap() = Some(child);
-
-            // Forward the backend's stdout/stderr to this process's own
-            // console for easier debugging during development.
-            tauri::async_runtime::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        CommandEvent::Stdout(line) => println!("[backend] {line}"),
-                        CommandEvent::Stderr(line) => eprintln!("[backend] {line}"),
-                        CommandEvent::Terminated(payload) => {
-                            eprintln!("[backend] exited: {:?}", payload);
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            Ok(())
-        })
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application");
-
-    app.run(move |_app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
-            if let Some(child) = child_handle.lock().unwrap().take() {
-                let _ = child.kill();
-            }
-        }
-    });
+    tauri::Builder::default()
+        .manage(ScanState(Arc::new(AtomicBool::new(false))))
+        .invoke_handler(tauri::generate_handler![
+            start_scan,
+            cancel_scan,
+            trial_status,
+            activate_license,
+            delete_files,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }

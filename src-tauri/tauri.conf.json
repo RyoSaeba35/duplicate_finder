@@ -17,7 +17,8 @@
         "scope": [
           {
             "name": "dupfinder_backend",
-            "sidecar": true
+            "sidecar": true,
+            "args": true
           }
         ]
       },

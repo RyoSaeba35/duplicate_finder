@@ -18,9 +18,85 @@
 
 #include "picosha2.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace dupfinder {
 
 namespace fs = std::filesystem;
+
+// Three independent, opt-in/opt-out filters for what a scan walks past
+// entirely (not found-then-hidden in the UI -- skipped before they're
+// even hashed, so they don't slow down a scan or show up as "0 files
+// wasted" noise).
+//   - skip_hidden_system: files/folders Windows itself marks Hidden or
+//     System (Thumbs.db, desktop.ini, etc.) -- on by default, since
+//     these are essentially never something you want to "clean up" via
+//     a duplicate finder, and touching some of them can be risky.
+//   - skip_system_folders: well-known OS folders (C:\Windows,
+//     ProgramData, the Recycle Bin, System Volume Information) -- on by
+//     default, since scanning these is virtually never useful and can
+//     be slow given how large they typically are.
+//   - skip_dev_noise: common build-tool/dependency folder names
+//     (node_modules, .git, target, build, dist, ...) -- OFF by default
+//     and opt-in, since a developer scanning their own projects may
+//     specifically want to find redundant copies of these (this
+//     project's own early test scans turned up real duplicate .jar/
+//     .class files, which this filter would otherwise hide unasked).
+struct ScanOptions {
+    bool skip_hidden_system = true;
+    bool skip_system_folders = true;
+    bool skip_dev_noise = false;
+};
+
+// Case-insensitive comparison -- Windows' filesystem is case-insensitive
+// anyway, but folder names arriving from JSON/user input shouldn't be
+// trusted to match a fixed case.
+inline bool iequals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (tolower(static_cast<unsigned char>(a[i])) != tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool is_system_folder_name(const std::string& name) {
+    static const std::vector<std::string> names = {
+        "Windows", "ProgramData", "$Recycle.Bin", "System Volume Information",
+        "Recovery", "Config.Msi", "PerfLogs",
+    };
+    for (const auto& n : names) if (iequals(name, n)) return true;
+    return false;
+}
+
+inline bool is_dev_noise_folder_name(const std::string& name) {
+    static const std::vector<std::string> names = {
+        "node_modules", ".git", ".svn", ".hg", "target", "build", "dist",
+        "bin", "obj", "__pycache__", ".venv", "venv", "vendor", ".idea",
+        ".vs", ".gradle", ".next", ".cache",
+    };
+    for (const auto& n : names) if (iequals(name, n)) return true;
+    return false;
+}
+
+// Windows-specific: true if the OS itself has flagged this path Hidden
+// or System, regardless of what its name looks like. On non-Windows
+// this just falls back to the POSIX convention of a leading dot, kept
+// for portability even though this project is Windows-primary and this
+// path is untested elsewhere.
+inline bool has_hidden_or_system_attribute(const fs::path& p) {
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesW(p.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false; // can't tell -- don't skip
+    return (attrs & FILE_ATTRIBUTE_HIDDEN) || (attrs & FILE_ATTRIBUTE_SYSTEM);
+#else
+    std::string name = p.filename().string();
+    return !name.empty() && name[0] == '.';
+#endif
+}
 
 struct FileEntry {
     std::string path;
@@ -85,14 +161,14 @@ class Scanner {
 public:
     // Kicks off a scan of `root` on a background thread. Safe to poll
     // progress()/results() from another thread while running.
-    void start(const std::string& root, uint64_t min_size_bytes);
+    void start(const std::string& root, uint64_t min_size_bytes, ScanOptions options = {});
     void cancel();
 
     ScanProgress progress();
     std::vector<DuplicateGroup> results();
 
 private:
-    void run(std::string root, uint64_t min_size_bytes);
+    void run(std::string root, uint64_t min_size_bytes, ScanOptions options);
     std::string hash_file(const fs::path& p, uint64_t size_hint);
 
     std::mutex mutex_;
@@ -116,14 +192,14 @@ inline std::string Scanner::hash_file(const fs::path& p, uint64_t /*size_hint*/)
     return picosha2::get_hash_hex_string(hasher);
 }
 
-inline void Scanner::start(const std::string& root, uint64_t min_size_bytes) {
+inline void Scanner::start(const std::string& root, uint64_t min_size_bytes, ScanOptions options) {
     cancel_requested_ = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         progress_ = ScanProgress{};
         results_.clear();
     }
-    std::thread(&Scanner::run, this, root, min_size_bytes).detach();
+    std::thread(&Scanner::run, this, root, min_size_bytes, options).detach();
 }
 
 inline void Scanner::cancel() { cancel_requested_ = true; }
@@ -138,7 +214,7 @@ inline std::vector<DuplicateGroup> Scanner::results() {
     return results_;
 }
 
-inline void Scanner::run(std::string root, uint64_t min_size_bytes) {
+inline void Scanner::run(std::string root, uint64_t min_size_bytes, ScanOptions options) {
     // Pass 1: walk the tree, group paths by size.
     //
     // Deliberately NOT using recursive_directory_iterator's throwing
@@ -194,13 +270,22 @@ inline void Scanner::run(std::string root, uint64_t min_size_bytes) {
             } else {
                 std::error_code type_ec;
                 if (entry.is_directory(type_ec) && !type_ec) {
-                    dirs_to_visit.push_back(entry.path());
+                    std::string dir_name = entry.path().filename().string();
+                    bool skip = false;
+                    if (options.skip_system_folders && is_system_folder_name(dir_name)) skip = true;
+                    if (!skip && options.skip_dev_noise && is_dev_noise_folder_name(dir_name)) skip = true;
+                    if (!skip && options.skip_hidden_system && has_hidden_or_system_attribute(entry.path())) skip = true;
+                    if (!skip) {
+                        dirs_to_visit.push_back(entry.path());
+                    }
                 } else {
                     std::error_code file_ec;
                     if (entry.is_regular_file(file_ec) && !file_ec) {
+                        bool skip_file = options.skip_hidden_system &&
+                                         has_hidden_or_system_attribute(entry.path());
                         std::error_code size_ec;
-                        uint64_t size = entry.file_size(size_ec);
-                        if (!size_ec && size >= min_size_bytes) {
+                        uint64_t size = skip_file ? 0 : entry.file_size(size_ec);
+                        if (!skip_file && !size_ec && size >= min_size_bytes) {
                             FileEntry fe;
                             fe.path = entry.path().string();
                             fe.filename = entry.path().filename().string();

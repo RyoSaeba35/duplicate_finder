@@ -1,44 +1,74 @@
 // main.cpp
-// Local REST API server for the duplicate file finder. Binds to
-// 127.0.0.1 only (never exposed to the network) and is launched by the
-// Tauri shell as a sidecar process. The React frontend talks to it over
-// plain HTTP on localhost.
+// One-shot CLI backend for the duplicate file finder. This process is
+// spawned by the Tauri shell once PER OPERATION, does exactly one job,
+// writes JSON to stdout, and exits. There is no HTTP server, no port, no
+// persistent process, and nothing for the shell to clean up on close --
+// the process's own exit IS the cleanup.
 //
-// Endpoints:
-//   POST /scan            body: {"path": "C:\\Users\\...", "min_size_kb": 4}
-//                          -> {"status": "started"}
-//   GET  /scan/progress    -> current ScanProgress as JSON
-//   GET  /scan/results     -> array of DuplicateGroup as JSON (once done)
-//   POST /scan/cancel      -> stop an in-progress scan
-//   POST /files/delete    body: {"paths": ["C:\\...", ...]}
-//                          -> moves files to the OS trash/recycle bin
-//                             (never a permanent delete), returns
-//                             per-file success/failure
-//   GET  /files/preview?path=<path>
-//                          -> raw image bytes with correct Content-Type,
-//                             for rendering a thumbnail in the split view.
-//                             Images only, capped at 20MB; anything else
-//                             returns 415.
+// Invocation: the subcommand is argv[1]; any parameters come as a single
+// line of JSON on stdin (the Rust shell writes "<json>\n"). Reading one
+// line (not slurping to EOF) means the caller never has to close stdin --
+// which matters for `scan`, whose stdin stays open afterwards to receive a
+// later "cancel" line.
+//
+//   trial-status        (no stdin)      -> {"licensed":..,"expired":..,...}
+//   activate-license    {"key":"..."}   -> {"success":true} | {"success":false,"error":".."}
+//   delete              {"paths":[...]} -> [{"path":..,"deleted":..,"error":..}, ...]
+//   scan                {"path":"..","min_size_kb":..,"skip_*":..}
+//                        -> streams one JSON line per progress tick
+//                           ({"type":"progress",...}), then one final
+//                           ({"type":"results","groups":[...]}) line.
+//                        Send a line "cancel" on stdin to stop it early.
+//
+// File preview is deliberately NOT here anymore: the webview loads local
+// files directly via Tauri's asset protocol (convertFileSrc) instead of
+// pulling bytes through this backend. See the frontend for that change.
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
-#include <fstream>
+#include <iostream>
 #include <sstream>
-#include <unordered_map>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
 
-#include "httplib.h"
+#include "license.hpp"
 #include "scanner.hpp"
 #include "trash.hpp"
+#include "trial.hpp"
 
 using namespace dupfinder;
 namespace fs = std::filesystem;
 
 namespace {
 
+// Loaded once at process start. Because each op is its own short-lived
+// process, "once at start" is simply "once" -- but the trial clock is
+// based on the first-run timestamp stored on disk, not on process uptime,
+// so this can't be gamed by relaunching.
+TrialState g_trial_state = load_or_create_trial_state();
+bool g_licensed = has_valid_saved_license();
 Scanner g_scanner;
 
-// Minimal JSON string escaping — good enough for file paths / messages.
-// (Not pulling in a full JSON library to keep the build dependency-free;
-// swap for nlohmann/json if the API grows past this.)
+// Extensions treated as previewable plain text. Deliberately an allowlist
+// rather than "anything not otherwise recognized" -- some text-adjacent
+// extensions (.class, .jar) are actually compiled binaries and would
+// render as garbage. Still used to set the is_text flag on each file.
+bool is_text_ext(const std::string& ext) {
+    static const std::unordered_set<std::string> text_exts = {
+        ".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".log", ".xml",
+        ".yaml", ".yml", ".ini", ".cfg", ".conf", ".toml", ".env",
+        ".java", ".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".less",
+        ".html", ".htm", ".c", ".cpp", ".cc", ".h", ".hpp", ".cs", ".go", ".rs",
+        ".rb", ".php", ".sh", ".bash", ".ps1", ".bat", ".sql", ".gradle",
+        ".properties", ".gitattributes", ".editorconfig",
+    };
+    return text_exts.count(ext) > 0;
+}
+
+// Minimal JSON string escaping -- good enough for file paths / messages.
 std::string json_escape(const std::string& s) {
     std::ostringstream out;
     for (char c : s) {
@@ -71,9 +101,13 @@ std::string status_to_string(ScanStatus s) {
     return "unknown";
 }
 
+// A single streamed progress line. The "type" discriminator lets the
+// frontend tell progress ticks apart from the final results payload, since
+// both now arrive on the same stdout stream instead of separate endpoints.
 std::string progress_to_json(const ScanProgress& p) {
     std::ostringstream j;
     j << "{"
+      << "\"type\":\"progress\","
       << "\"status\":\"" << status_to_string(p.status) << "\","
       << "\"files_seen\":" << p.files_seen << ","
       << "\"files_hashed\":" << p.files_hashed << ","
@@ -87,12 +121,17 @@ std::string progress_to_json(const ScanProgress& p) {
 
 std::string file_entry_to_json(const FileEntry& f) {
     std::ostringstream j;
+    std::string ext_lower = f.extension;
+    for (auto& c : ext_lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
     j << "{"
       << "\"path\":\"" << json_escape(f.path) << "\","
       << "\"filename\":\"" << json_escape(f.filename) << "\","
       << "\"size_bytes\":" << f.size_bytes << ","
       << "\"extension\":\"" << json_escape(f.extension) << "\","
       << "\"is_image\":" << (is_image_ext(f.extension) ? "true" : "false") << ","
+      << "\"is_text\":" << (is_text_ext(ext_lower) ? "true" : "false") << ","
+      << "\"is_docx\":" << (ext_lower == ".docx" ? "true" : "false") << ","
+      << "\"is_xlsx\":" << (ext_lower == ".xlsx" ? "true" : "false") << ","
       << "\"modified_unix\":" << f.modified_unix
       << "}";
     return j.str();
@@ -120,10 +159,14 @@ std::string results_to_json(const std::vector<DuplicateGroup>& groups) {
 }
 
 // Decodes a JSON string literal starting at the opening quote (body[pos]
-// must be '"'). Returns the decoded value and advances pos to just past
-// the closing quote. Shared by extract_json_string and the /files/delete
-// array parser so there's exactly one place that understands JSON escape
-// sequences, instead of two subtly-different copies.
+// must be '"'). Returns the decoded value and advances pos past the closing
+// quote. Shared by extract_json_string and the delete-op array parser so
+// there's exactly one place that understands JSON escapes.
+//
+// IMPORTANT: this is why the request is a JSON *object* on stdin rather
+// than raw argv -- Windows paths are full of backslashes, JSON.stringify on
+// the frontend escapes each one as "\\", and this is what decodes them back
+// so a bare drive root like "C:\" survives round-trip intact.
 std::string decode_json_string_at(const std::string& body, size_t& pos) {
     pos++; // move past the opening quote
     std::string result;
@@ -140,11 +183,6 @@ std::string decode_json_string_at(const std::string& body, size_t& pos) {
                 case 'b':  result.push_back('\b'); pos += 2; break;
                 case 'f':  result.push_back('\f'); pos += 2; break;
                 case 'u': {
-                    // Basic \uXXXX handling for the common case (BMP,
-                    // non-surrogate-pair code points — sufficient for the
-                    // file paths and filenames this API actually deals
-                    // with; a full surrogate-pair decoder is unnecessary
-                    // complexity here).
                     if (pos + 5 < body.size()) {
                         std::string hex = body.substr(pos + 2, 4);
                         unsigned int code = 0;
@@ -178,21 +216,6 @@ std::string decode_json_string_at(const std::string& body, size_t& pos) {
     return result;
 }
 
-// Extremely small helper to pull a string/int field out of a flat JSON
-// object without a real parser. The frontend only ever sends flat,
-// single-level bodies, so this is sufficient and keeps the backend
-// dependency-free.
-//
-// IMPORTANT: this decodes standard JSON escape sequences via
-// decode_json_string_at rather than returning the raw substring between
-// quotes. Windows paths are full of backslashes, and JSON.stringify on
-// the frontend correctly escapes each one as "\\" — so without decoding
-// here, every path arrives with every backslash doubled. That happens to
-// still resolve for paths with something after the doubled separator
-// (Windows path normalization tolerates redundant separators in the
-// middle of a path), but silently fails for a bare drive root like "C:\"
-// (sent as "C:\\\\" in JSON, decodes to "C:\\", which is not a valid
-// root) — exactly the bug this fixes.
 std::string extract_json_string(const std::string& body, const std::string& key) {
     std::string needle = "\"" + key + "\"";
     auto pos = body.find(needle);
@@ -218,154 +241,168 @@ uint64_t extract_json_number(const std::string& body, const std::string& key, ui
     return std::stoull(body.substr(pos, end - pos));
 }
 
+bool extract_json_bool(const std::string& body, const std::string& key, bool fallback) {
+    std::string needle = "\"" + key + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return fallback;
+    pos = body.find(':', pos);
+    if (pos == std::string::npos) return fallback;
+    pos++;
+    while (pos < body.size() && isspace(static_cast<unsigned char>(body[pos]))) pos++;
+    if (body.compare(pos, 4, "true") == 0) return true;
+    if (body.compare(pos, 5, "false") == 0) return false;
+    return fallback;
+}
+
+// Reads a single line (one JSON request) from stdin. Requests are one line
+// each; a line read -- unlike slurping to EOF -- doesn't require the caller
+// to close stdin, which the scan op relies on (it keeps stdin open for a
+// later "cancel").
+std::string read_request_line() {
+    std::string line;
+    std::getline(std::cin, line);
+    return line;
+}
+
+std::string trial_status_to_json() {
+    int remaining = trial_days_remaining(g_trial_state);
+    bool expired = trial_is_expired(g_trial_state);
+    std::ostringstream j;
+    j << "{"
+      << "\"licensed\":" << (g_licensed ? "true" : "false") << ","
+      << "\"expired\":" << (expired ? "true" : "false") << ","
+      << "\"days_remaining\":" << remaining << ","
+      << "\"trial_days\":" << kTrialDays
+      << "}";
+    return j.str();
+}
+
+// A pre-scan failure, shaped like a terminal progress tick so the frontend
+// can surface it through the exact same code path as a normal finish.
+void emit_error_progress(const std::string& msg) {
+    std::cout << "{\"type\":\"progress\",\"status\":\"error\","
+              << "\"files_seen\":0,\"files_hashed\":0,\"candidates\":0,"
+              << "\"bytes_hashed\":0,\"current_path\":\"\","
+              << "\"error_message\":\"" << json_escape(msg) << "\"}"
+              << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    int port = 8721; // arbitrary fixed local port; change here if it clashes
-    if (argc > 1) port = std::atoi(argv[1]);
+    if (argc < 2) {
+        std::cerr << "usage: dupfinder_backend <scan|delete|trial-status|activate-license>\n";
+        return 2;
+    }
+    const std::string cmd = argv[1];
 
-    httplib::Server svr;
+    if (cmd == "trial-status") {
+        std::cout << trial_status_to_json() << std::endl;
+        return 0;
+    }
 
-    // CORS: Tauri's webview origin varies by platform (tauri://localhost on
-    // some, http://tauri.localhost on others) so we just allow localhost
-    // origins broadly rather than hardcoding one.
-    svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type");
-        return httplib::Server::HandlerResponse::Unhandled;
-    });
-    svr.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
-        res.status = 204;
-    });
-
-    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content("{\"ok\":true}", "application/json");
-    });
-
-    svr.Post("/scan", [](const httplib::Request& req, httplib::Response& res) {
-        std::string path = extract_json_string(req.body, "path");
-        uint64_t min_size_kb = extract_json_number(req.body, "min_size_kb", 1);
-
-        if (path.empty() || !fs::exists(path)) {
-            res.status = 400;
-            res.set_content("{\"error\":\"path does not exist\"}", "application/json");
-            return;
+    if (cmd == "activate-license") {
+        const std::string body = read_request_line();
+        const std::string key = extract_json_string(body, "key");
+        if (!license_key_is_valid(key)) {
+            std::cout << R"({"success":false,"error":"invalid license key"})" << std::endl;
+            return 0;  // success:false rides in the JSON, not the exit code
         }
-
-        g_scanner.start(path, min_size_kb * 1024);
-        res.set_content("{\"status\":\"started\"}", "application/json");
-    });
-
-    svr.Post("/scan/cancel", [](const httplib::Request&, httplib::Response& res) {
-        g_scanner.cancel();
-        res.set_content("{\"status\":\"cancelling\"}", "application/json");
-    });
-
-    svr.Get("/scan/progress", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(progress_to_json(g_scanner.progress()), "application/json");
-    });
-
-    svr.Get("/scan/results", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(results_to_json(g_scanner.results()), "application/json");
-    });
-
-    // Serves raw image bytes for the split-view thumbnail. Deliberately
-    // narrow scope: only recognized image extensions, and capped at 20MB
-    // so a huge accidental match (e.g. a giant TIFF) can't stall the
-    // single-threaded httplib server on one request. Anything else — PDFs,
-    // videos, documents — isn't previewed inline; those get an "Open"
-    // link instead (handled entirely on the frontend via the OS's default
-    // application, no backend involvement needed).
-    svr.Get("/files/preview", [](const httplib::Request& req, httplib::Response& res) {
-        if (!req.has_param("path")) {
-            res.status = 400;
-            res.set_content("{\"error\":\"missing path parameter\"}", "application/json");
-            return;
+        if (!save_license_key(key)) {
+            std::cout << R"({"success":false,"error":"could not save license"})" << std::endl;
+            return 0;
         }
-        // httplib decodes query parameters automatically.
-        std::string path = req.get_param_value("path");
+        // No in-memory "unlock" flag to flip: this process is about to exit.
+        // The unlock lives on DISK now (save_license_key wrote it); the next
+        // `trial-status` process reads it back via has_valid_saved_license()
+        // at startup. State persists in files, not in a resident process --
+        // that's the whole shift from the server model.
+        std::cout << R"({"success":true})" << std::endl;
+        return 0;
+    }
 
-        std::error_code ec;
-        if (path.empty() || !fs::exists(path, ec) || ec) {
-            res.status = 404;
-            res.set_content("{\"error\":\"file not found\"}", "application/json");
-            return;
-        }
-
-        std::string ext = fs::path(path).extension().string();
-        for (auto& c : ext) c = static_cast<char>(tolower(c));
-        // Images render via <img>; PDFs render via WebView2's own built-in
-        // PDF viewer inside an <iframe> — same trick a normal Chromium
-        // browser uses for PDFs served over plain HTTP, no separate PDF
-        // rendering library needed on the backend. Everything else still
-        // falls back to the file-type badge on the frontend.
-        bool is_pdf = (ext == ".pdf");
-        if (!is_image_ext(ext) && !is_pdf) {
-            res.status = 415;
-            res.set_content("{\"error\":\"not a previewable file type\"}", "application/json");
-            return;
-        }
-
-        uint64_t size = fs::file_size(path, ec);
-        constexpr uint64_t kMaxPreviewBytes = 20ull * 1024 * 1024;
-        if (ec || size > kMaxPreviewBytes) {
-            res.status = 413;
-            res.set_content("{\"error\":\"file too large to preview\"}", "application/json");
-            return;
-        }
-
-        std::ifstream f(path, std::ios::binary);
-        if (!f) {
-            res.status = 500;
-            res.set_content("{\"error\":\"could not open file\"}", "application/json");
-            return;
-        }
-        std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
-        static const std::unordered_map<std::string, std::string> mime_types = {
-            {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".png", "image/png"},
-            {".gif", "image/gif"}, {".bmp", "image/bmp"}, {".webp", "image/webp"},
-            {".svg", "image/svg+xml"}, {".tif", "image/tiff"}, {".tiff", "image/tiff"},
-            {".pdf", "application/pdf"},
-        };
-        auto it = mime_types.find(ext);
-        std::string content_type = it != mime_types.end() ? it->second : "application/octet-stream";
-
-        res.set_content(data, content_type);
-    });
-
-    // Moves files the user picked in the UI to the OS trash/recycle bin —
-    // never a permanent delete. Takes a flat JSON array of paths, e.g.
-    // {"paths": ["C:\\a.jpg", "C:\\b.jpg"]}. Returns per-file success so a
-    // partial failure (locked file, permissions) doesn't silently swallow
-    // the rest.
-    svr.Post("/files/delete", [](const httplib::Request& req, httplib::Response& res) {
-        std::ostringstream out;
-        out << "[";
+    if (cmd == "delete") {
+        // Body is {"paths":["C:\\a.jpg", ...]}. We walk every quoted string,
+        // skip the "paths" key itself, and trash the rest -- reporting
+        // per-file success so one locked/denied file doesn't sink the batch.
+        const std::string body = read_request_line();
+        std::cout << "[";
         size_t pos = 0;
         bool first = true;
-        const std::string& body = req.body;
         while (true) {
             pos = body.find('"', pos);
             if (pos == std::string::npos) break;
             std::string candidate = decode_json_string_at(body, pos);
-            if (candidate == "paths") continue; // skip the key itself
+            if (candidate == "paths") continue;  // the key, not a value
 
             std::string error_msg;
             bool ok = move_to_trash(candidate, error_msg);
-            if (!first) out << ",";
+            if (!first) std::cout << ",";
             first = false;
-            out << "{\"path\":\"" << json_escape(candidate) << "\","
-                << "\"deleted\":" << (ok ? "true" : "false") << ","
-                << "\"error\":\"" << json_escape(error_msg) << "\""
-                << "}";
+            std::cout << "{\"path\":\"" << json_escape(candidate) << "\","
+                      << "\"deleted\":" << (ok ? "true" : "false") << ","
+                      << "\"error\":\"" << json_escape(error_msg) << "\"}";
         }
-        out << "]";
-        res.set_content(out.str(), "application/json");
-    });
+        std::cout << "]" << std::endl;
+        return 0;
+    }
 
-    printf("dup-finder backend listening on http://127.0.0.1:%d\n", port);
-    svr.listen("127.0.0.1", port);
-    return 0;
+    if (cmd == "scan") {
+        const std::string body = read_request_line();
+        std::string path = extract_json_string(body, "path");
+        uint64_t min_size_kb = extract_json_number(body, "min_size_kb", 1);
+
+        ScanOptions options;
+        options.skip_hidden_system = extract_json_bool(body, "skip_hidden_system", true);
+        options.skip_system_folders = extract_json_bool(body, "skip_system_folders", true);
+        options.skip_dev_noise = extract_json_bool(body, "skip_dev_noise", false);
+
+        // Same gate the old /scan endpoint enforced, server-side.
+        if (!g_licensed && trial_is_expired(g_trial_state)) {
+            emit_error_progress("trial expired");
+            return 0;
+        }
+        if (path.empty() || !fs::exists(path)) {
+            emit_error_progress("path does not exist");
+            return 0;
+        }
+
+        // Watch stdin for a "cancel" line on a background thread. The first
+        // stdin line (the params, read above) is already consumed, so this
+        // thread only ever sees lines sent *after* the scan begins.
+        // Detached: when the scan finishes normally this thread is still
+        // blocked in getline, and the process exit tears it down cleanly.
+        std::thread([] {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line == "cancel") {
+                    g_scanner.cancel();
+                    break;
+                }
+            }
+        }).detach();
+
+        g_scanner.start(path, min_size_kb * 1024, options);
+
+        // Observe the (unchanged) engine and stream a progress line each
+        // tick until it leaves RUNNING. We poll the engine here rather than
+        // refactoring Scanner to push callbacks -- deliberately the
+        // lower-churn choice, since the scan engine is the hard-won part we
+        // don't want to disturb. Scanner sets results_ and the terminal
+        // status under one lock, so once we observe a non-RUNNING status the
+        // results are guaranteed already populated.
+        for (;;) {
+            ScanProgress p = g_scanner.progress();
+            std::cout << progress_to_json(p) << std::endl;
+            if (p.status != ScanStatus::RUNNING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+
+        std::cout << "{\"type\":\"results\",\"groups\":"
+                  << results_to_json(g_scanner.results()) << "}" << std::endl;
+        return 0;
+    }
+
+    std::cerr << "unknown subcommand: " << cmd << "\n";
+    return 2;
 }

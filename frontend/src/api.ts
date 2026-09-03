@@ -1,7 +1,8 @@
-// api.ts — thin client for the local C++ backend REST API.
-// The backend always runs on 127.0.0.1 so there's no auth/HTTPS concern.
+// api.ts — thin client for the Tauri backend.
+// All scan logic runs natively in-process via Rust commands.
 
-const BASE_URL = "http://127.0.0.1:8721";
+import { invoke } from "@tauri-apps/api/tauri";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
 export interface FileEntry {
   path: string;
@@ -9,6 +10,9 @@ export interface FileEntry {
   size_bytes: number;
   extension: string;
   is_image: boolean;
+  is_text: boolean;
+  is_docx: boolean;
+  is_xlsx: boolean;
   modified_unix: number;
 }
 
@@ -31,30 +35,64 @@ export interface ScanProgress {
   error_message: string;
 }
 
-export async function startScan(path: string, minSizeKb = 1): Promise<void> {
-  const res = await fetch(`${BASE_URL}/scan`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, min_size_kb: minSizeKb }),
+export interface ScanOptions {
+  skipHiddenSystem?: boolean;
+  skipSystemFolders?: boolean;
+  skipDevNoise?: boolean;
+  /// Only hash files with these extensions e.g. [".jpg", ".pdf"].
+  /// Empty array = no filter, all extensions are scanned.
+  extensionFilter?: string[];
+}
+
+export async function startScan(
+  path: string,
+  minSizeKb: number,
+  options: ScanOptions,
+  onProgress: (p: ScanProgress) => void,
+  onResults: (groups: DuplicateGroup[]) => void
+): Promise<UnlistenFn> {
+  const request = {
+    path,
+    min_size_kb: minSizeKb,
+    ...(options.skipHiddenSystem !== undefined && { skip_hidden_system: options.skipHiddenSystem }),
+    ...(options.skipSystemFolders !== undefined && { skip_system_folders: options.skipSystemFolders }),
+    ...(options.skipDevNoise !== undefined && { skip_dev_noise: options.skipDevNoise }),
+    ...(options.extensionFilter && options.extensionFilter.length > 0 && {
+      extension_filter: options.extensionFilter,
+    }),
+  };
+
+  const unlistenEvent = await listen<any>("scan-event", (event) => {
+    const msg = event.payload;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "progress") {
+      onProgress(msg as ScanProgress);
+    } else if (msg.type === "results") {
+      onResults(msg.groups as DuplicateGroup[]);
+    }
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: "unknown error" }));
-    throw new Error(body.error ?? `scan failed (${res.status})`);
+
+  const unlistenTerminated = await listen("scan-terminated", () => {
+    unlistenEvent();
+    unlistenTerminated();
+  });
+
+  try {
+    await invoke("start_scan", { request: JSON.stringify(request) });
+  } catch (e) {
+    unlistenEvent();
+    unlistenTerminated();
+    throw e instanceof Error ? e : new Error(String(e));
   }
+
+  return () => {
+    unlistenEvent();
+    unlistenTerminated();
+  };
 }
 
 export async function cancelScan(): Promise<void> {
-  await fetch(`${BASE_URL}/scan/cancel`, { method: "POST" });
-}
-
-export async function getProgress(): Promise<ScanProgress> {
-  const res = await fetch(`${BASE_URL}/scan/progress`);
-  return res.json();
-}
-
-export async function getResults(): Promise<DuplicateGroup[]> {
-  const res = await fetch(`${BASE_URL}/scan/results`);
-  return res.json();
+  await invoke("cancel_scan");
 }
 
 export interface DeleteResult {
@@ -64,12 +102,22 @@ export interface DeleteResult {
 }
 
 export async function deleteFiles(paths: string[]): Promise<DeleteResult[]> {
-  const res = await fetch(`${BASE_URL}/files/delete`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths }),
-  });
-  return res.json();
+  return invoke<DeleteResult[]>("delete_files", { paths });
+}
+
+export interface TrialStatus {
+  licensed: boolean;
+  expired: boolean;
+  days_remaining: number;
+  trial_days: number;
+}
+
+export async function getTrialStatus(): Promise<TrialStatus> {
+  return invoke<TrialStatus>("trial_status");
+}
+
+export async function activateLicense(key: string): Promise<{ success: boolean; error?: string }> {
+  return invoke<{ success: boolean; error?: string }>("activate_license", { key });
 }
 
 export function formatBytes(bytes: number): string {
@@ -85,12 +133,9 @@ export function formatBytes(bytes: number): string {
 }
 
 export function formatModifiedDate(unixSeconds: number): string | null {
-  if (!unixSeconds) return null; // 0 means the backend couldn't read it
+  if (!unixSeconds) return null;
   return new Date(unixSeconds * 1000).toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
+    year: "numeric", month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit",
   });
 }

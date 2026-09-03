@@ -1,4 +1,11 @@
+import { useEffect, useState } from "react";
 import { DuplicateGroup, FileEntry, formatBytes, formatModifiedDate } from "../api";
+import { TextPreview, DocxPreview, XlsxPreview } from "./FilePreview";
+import { useTranslation } from "../i18n/context";
+import { useAppMode } from "./LicenseGate";
+import type { TranslationKey } from "../i18n/locales/en";
+
+const BUY_URL = "https://pierrecode.gumroad.com/l/byzsj";
 
 interface Props {
   group: DuplicateGroup | null;
@@ -8,162 +15,225 @@ interface Props {
   onToggleSelect: (path: string) => void;
 }
 
-const PREVIEW_BASE_URL = "http://127.0.0.1:8721/files/preview";
+function usePreviewUrl(path: string): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { convertFileSrc } = await import("@tauri-apps/api/tauri");
+        if (!cancelled) setUrl(convertFileSrc(path));
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, [path]);
+  return url;
+}
 
-// Bumped up from the original 180px, then 280px, per feedback that the
-// preview felt cramped — this is roughly half a typical laptop screen's
-// height, enough to actually read a PDF page or judge a photo without
-// needing to open it separately.
 const PREVIEW_HEIGHT = 480;
+const TEXT_PREVIEW_MAX = 2 * 1024 * 1024;
+const BINARY_PREVIEW_MAX = 20 * 1024 * 1024;
+const PDF_LOAD_TIMEOUT_MS = 4000;
 
-// Opens a file with the OS's default application (e.g. an image viewer,
-// PDF reader, whatever the user has associated with that file type).
-// Dynamic import for the same reason as the folder picker in
-// ScanControls.tsx: this file still loads fine in the plain-browser dev
-// preview, where the Tauri shell API isn't injected — it only actually
-// gets called from inside the real desktop app.
-async function openFile(path: string) {
+async function openFile(
+  path: string,
+  t: (key: TranslationKey, params?: Record<string, string | number>) => string
+) {
   let openFn: (path: string) => Promise<void>;
   try {
     ({ open: openFn } = await import("@tauri-apps/api/shell"));
   } catch {
-    alert(
-      "Opening files only works inside the installed desktop app, not the browser preview."
-    );
+    alert(t("splitView.openFileOnlyInApp"));
     return;
   }
   try {
     await openFn(path);
   } catch (e) {
-    // A real failure inside the actual app — show what Tauri actually
-    // said instead of a generic message, so a permission/scope problem
-    // (like the one that motivated this split) is visible and debuggable
-    // rather than silently swallowed.
-    alert(`Couldn't open this file: ${e instanceof Error ? e.message : String(e)}`);
+    alert(t("splitView.couldNotOpenFile", { message: e instanceof Error ? e.message : String(e) }));
   }
 }
 
+function PreviewPlaceholder() {
+  return (
+    <div style={{
+      width: "100%", height: PREVIEW_HEIGHT, borderRadius: "var(--radius)",
+      background: "var(--bg-base)", display: "flex", alignItems: "center", justifyContent: "center",
+    }}>
+      <span className="spinner" aria-hidden="true" />
+    </div>
+  );
+}
+
+function PreviewError({ label, onRetry }: { label: string; onRetry?: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div style={{
+      width: "100%", height: PREVIEW_HEIGHT, borderRadius: "var(--radius)",
+      background: "var(--bg-base)", display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", gap: 12,
+    }}>
+      <span className="mono" style={{
+        fontSize: 22, fontWeight: 700, letterSpacing: 1, color: "var(--text-tertiary)",
+        border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 18px",
+      }}>
+        {label}
+      </span>
+      {onRetry && (
+        <button onClick={onRetry} style={{
+          background: "transparent", border: "1px solid var(--border)",
+          borderRadius: "var(--radius)", color: "var(--text-secondary)", fontSize: 12, padding: "5px 12px",
+        }}>
+          {t("splitView.retryPreview")}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function PdfPreview({ url, filename }: { url: string; filename: string }) {
+  const [loadState, setLoadState] = useState<"loading" | "loaded" | "error">("loading");
+  const [retryKey, setRetryKey] = useState(0);
+
+  useEffect(() => {
+    setLoadState("loading");
+    const timer = setTimeout(() => {
+      setLoadState((prev) => (prev === "loading" ? "error" : prev));
+    }, PDF_LOAD_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [url, retryKey]);
+
+  if (loadState === "error") {
+    return <PreviewError label="PDF" onRetry={() => setRetryKey((k) => k + 1)} />;
+  }
+
+  return (
+    <div style={{ position: "relative", width: "100%", height: PREVIEW_HEIGHT }}>
+      {loadState === "loading" && (
+        <div style={{ position: "absolute", inset: 0, zIndex: 1 }}>
+          <PreviewPlaceholder />
+        </div>
+      )}
+      <iframe
+        key={retryKey}
+        src={url}
+        title={filename}
+        onLoad={() => setLoadState("loaded")}
+        style={{
+          width: "100%", height: PREVIEW_HEIGHT, border: "none",
+          borderRadius: "var(--radius)", background: "var(--bg-base)",
+          opacity: loadState === "loaded" ? 1 : 0,
+          transition: "opacity 0.15s ease",
+        }}
+      />
+    </div>
+  );
+}
+
 function FileCard({
-  file,
-  role,
-  onSetKeep,
-  isSelected,
-  onToggleSelect,
+  file, role, onSetKeep, isSelected, onToggleSelect, previewDelay,
 }: {
   file: FileEntry;
   role: "keep" | "duplicate";
   onSetKeep: () => void;
   isSelected: boolean;
   onToggleSelect: () => void;
+  previewDelay: number;
 }) {
+  const previewUrl = usePreviewUrl(file.path);
+  const sizeOk = file.is_text
+    ? file.size_bytes <= TEXT_PREVIEW_MAX
+    : file.size_bytes <= BINARY_PREVIEW_MAX;
+  const { t } = useTranslation();
+  const { isFreeMode } = useAppMode();
+
+  const [previewReady, setPreviewReady] = useState(previewDelay === 0);
+  useEffect(() => {
+    if (previewDelay === 0) return;
+    const timer = setTimeout(() => setPreviewReady(true), previewDelay);
+    return () => clearTimeout(timer);
+  }, [previewDelay]);
+
   return (
-    <div
-      style={{
-        border: `1px solid ${role === "keep" ? "var(--accent-teal-dim)" : "var(--border)"}`,
-        borderRadius: "var(--radius)",
-        background: "var(--bg-panel-raised)",
-        padding: 14,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-      }}
-    >
+    <div style={{
+      border: `1px solid ${role === "keep" ? "var(--accent-teal-dim)" : "var(--border)"}`,
+      borderRadius: "var(--radius)", background: "var(--bg-panel-raised)",
+      padding: 14, display: "flex", flexDirection: "column", gap: 8,
+    }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <span
-          style={{
-            fontSize: 10,
-            textTransform: "uppercase",
-            letterSpacing: 0.5,
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{
+            fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 700,
             color: role === "keep" ? "var(--accent-teal)" : "var(--text-secondary)",
-            fontWeight: 700,
-          }}
-        >
-          {role === "keep" ? "Keep" : "Duplicate"}
-        </span>
+          }}>
+            {role === "keep" ? t("splitView.keep") : t("splitView.duplicate")}
+          </span>
+          {role === "keep" && (
+            <span
+              title={t("splitView.keepTooltip")}
+              aria-label={t("splitView.keepTooltip")}
+              style={{ fontSize: 11, color: "var(--text-tertiary)", cursor: "help", lineHeight: 1, userSelect: "none" }}
+            >
+              ⓘ
+            </span>
+          )}
+        </div>
 
         {role === "duplicate" && (
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-secondary)" }}>
-            <input type="checkbox" checked={isSelected} onChange={onToggleSelect} />
-            mark for trash
-          </label>
+          isFreeMode ? (
+            <a href={BUY_URL} target="_blank" rel="noreferrer"
+              title={t("licenseGate.freeModeUpgrade")}
+              style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--text-tertiary)", textDecoration: "none" }}>
+              <span aria-hidden="true">🔒</span>
+              {t("licenseGate.freeModeMarkLocked")}
+            </a>
+          ) : (
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+              <input type="checkbox" checked={isSelected} onChange={onToggleSelect} />
+              {t("splitView.markForTrash")}
+            </label>
+          )
         )}
       </div>
 
-      {file.is_image ? (
-        <img
-          src={`${PREVIEW_BASE_URL}?path=${encodeURIComponent(file.path)}`}
-          alt={file.filename}
-          style={{
-            width: "100%",
-            height: PREVIEW_HEIGHT,
-            objectFit: "contain",
-            borderRadius: "var(--radius)",
-            background: "var(--bg-base)",
-          }}
-          // If the backend can't serve this one (too large, unreadable,
-          // etc.) just hide the broken-image icon rather than showing it.
-          onError={(e) => {
-            (e.currentTarget as HTMLImageElement).style.display = "none";
-          }}
-        />
-      ) : file.extension === ".pdf" ? (
-        // WebView2 (the Windows webview Tauri uses) has the same
-        // built-in PDF viewer Chrome does — an <iframe> pointed at a PDF
-        // URL renders it directly, complete with its own zoom/scroll/page
-        // controls, no extra rendering library needed.
-        <iframe
-          src={`${PREVIEW_BASE_URL}?path=${encodeURIComponent(file.path)}`}
-          title={file.filename}
-          style={{
-            width: "100%",
-            height: PREVIEW_HEIGHT,
-            border: "none",
-            borderRadius: "var(--radius)",
-            background: "var(--bg-base)",
-          }}
-        />
+      {!previewReady || !previewUrl ? (
+        <PreviewPlaceholder />
+      ) : file.is_image && sizeOk ? (
+        <img src={previewUrl} alt={file.filename} style={{
+          width: "100%", height: PREVIEW_HEIGHT, objectFit: "contain",
+          borderRadius: "var(--radius)", background: "var(--bg-base)",
+        }} onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
+      ) : file.extension === ".pdf" && sizeOk ? (
+        <PdfPreview url={previewUrl} filename={file.filename} />
+      ) : file.is_text && sizeOk ? (
+        <div style={{ height: PREVIEW_HEIGHT }}><TextPreview url={previewUrl} extension={file.extension} /></div>
+      ) : file.is_docx && sizeOk ? (
+        <div style={{ height: PREVIEW_HEIGHT }}><DocxPreview url={previewUrl} /></div>
+      ) : file.is_xlsx && sizeOk ? (
+        <div style={{ height: PREVIEW_HEIGHT }}><XlsxPreview url={previewUrl} /></div>
       ) : (
-        // No real preview for other types (videos, docs, archives — each
-        // would need its own renderer, out of scope for now). A clear
-        // file-type badge is a lightweight stand-in that still helps at
-        // a glance; "open file" above covers actually viewing them.
-        <div
-          style={{
-            width: "100%",
-            height: PREVIEW_HEIGHT,
-            borderRadius: "var(--radius)",
-            background: "var(--bg-base)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <span
-            className="mono"
-            style={{
-              fontSize: 22,
-              fontWeight: 700,
-              letterSpacing: 1,
-              color: "var(--text-tertiary)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius)",
-              padding: "10px 18px",
-            }}
-          >
+        <div style={{
+          width: "100%", height: PREVIEW_HEIGHT, borderRadius: "var(--radius)",
+          background: "var(--bg-base)", display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <span className="mono" style={{
+            fontSize: 22, fontWeight: 700, letterSpacing: 1, color: "var(--text-tertiary)",
+            border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 18px",
+          }}>
             {(file.extension || "file").replace(".", "").toUpperCase()}
           </span>
         </div>
       )}
 
-      <div style={{ fontSize: 14, fontWeight: 600, wordBreak: "break-word" }}>
-        {file.filename}
-      </div>
+      <div style={{ fontSize: 15, fontWeight: 600, wordBreak: "break-word" }}>{file.filename}</div>
 
-      <div className="mono" style={{ fontSize: 11, color: "var(--text-tertiary)", wordBreak: "break-all" }}>
+      <div className="mono" style={{ fontSize: 13, color: "var(--text-secondary)", wordBreak: "break-all" }}>
         {file.path}
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, color: "var(--text-secondary)" }}>
+      <div style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        fontSize: 13, color: "var(--text-secondary)", flexWrap: "wrap", gap: 8,
+      }}>
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
           <span>{formatBytes(file.size_bytes)}</span>
           {formatModifiedDate(file.modified_unix) && (
@@ -171,31 +241,19 @@ function FileCard({
               {formatModifiedDate(file.modified_unix)}
             </span>
           )}
-          <button
-            onClick={() => openFile(file.path)}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "var(--accent-teal)",
-              fontSize: 11,
-              padding: 0,
-            }}
-          >
-            open file ↗
+          <button onClick={() => openFile(file.path, t)} style={{
+            background: "var(--bg-panel-raised)", border: "1px solid var(--border)",
+            borderRadius: "var(--radius)", color: "var(--accent-teal)", fontSize: 13, fontWeight: 600, padding: "6px 12px",
+          }}>
+            {t("splitView.openFile")}
           </button>
         </div>
-        {role === "duplicate" && (
-          <button
-            onClick={onSetKeep}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "var(--accent-teal)",
-              fontSize: 11,
-              padding: 0,
-            }}
-          >
-            keep this one instead →
+        {role === "duplicate" && !isFreeMode && (
+          <button onClick={onSetKeep} style={{
+            background: "var(--bg-panel-raised)", border: "1px solid var(--border)",
+            borderRadius: "var(--radius)", color: "var(--accent-teal)", fontSize: 13, fontWeight: 600, padding: "6px 12px",
+          }}>
+            {t("splitView.keepThisOneInstead")}
           </button>
         )}
       </div>
@@ -204,72 +262,143 @@ function FileCard({
 }
 
 export default function SplitView({ group, keepPath, onSetKeep, selectedForDeletion, onToggleSelect }: Props) {
+  const { t } = useTranslation();
+
+  const [dupIndex, setDupIndex] = useState(0);
+  useEffect(() => {
+    setDupIndex(0);
+  }, [group?.hash]);
+
   if (!group) {
     return (
-      <div
-        style={{
-          flex: 1,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: "var(--text-tertiary)",
-        }}
-      >
-        Select a duplicate set on the left to compare files.
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-tertiary)" }}>
+        {t("splitView.selectPrompt")}
       </div>
     );
   }
 
   const keepFile = group.files.find((f) => f.path === keepPath) ?? group.files[0];
   const duplicates = group.files.filter((f) => f.path !== keepFile.path);
+  const currentDup = duplicates[dupIndex] ?? duplicates[0];
+  const hasMultiple = duplicates.length > 1;
+  const markedCount = duplicates.filter((f) => selectedForDeletion.has(f.path)).length;
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-      <div
-        style={{
+
+      {/* ── Info bar — split into two halves mirroring the panels below.
+          Left half: summary text (aligned with KEEP panel).
+          Right half: navigator centered (aligned with DUPLICATE panel).
+          Both halves sit on the same horizontal line. ── */}
+      <div style={{
+        display: "flex",
+        borderBottom: "1px solid var(--border)",
+        background: "var(--bg-panel)",
+        flexShrink: 0,
+      }}>
+        {/* Left half — summary info */}
+        <div style={{
+          flex: 1,
           padding: "10px 20px",
-          borderBottom: "1px solid var(--border)",
-          fontSize: 11,
+          background: "var(--bg-panel-raised)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          fontSize: 12,
           color: "var(--text-tertiary)",
-        }}
-      >
-        {group.files.length} identical files &middot; {formatBytes(group.size_bytes)} each &middot;{" "}
-        <span style={{ color: "var(--accent-teal)" }}>{formatBytes(group.wasted_bytes)}</span> reclaimable
+        }}>
+          <span>
+            {t("splitView.summaryLabel", { count: group.files.length, size: formatBytes(group.size_bytes) })}{" "}
+            &middot;{" "}
+            <span style={{ color: "var(--accent-teal)" }}>{formatBytes(group.wasted_bytes)}</span>{" "}
+            {t("splitView.reclaimable")}
+          </span>
+          {markedCount > 0 && (
+            <span style={{ color: "var(--accent-danger)", fontWeight: 600, marginLeft: 12 }}>
+              {markedCount} / {duplicates.length} {t("splitView.markedLabel")}
+            </span>
+          )}
+        </div>
+
+        {/* Right half — navigator centered over the duplicate panel */}
+        <div style={{
+          flex: 1,
+          padding: "6px 16px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          minHeight: 38,
+        }}>
+          {hasMultiple && (
+            <>
+              <button
+                onClick={() => setDupIndex((i) => Math.max(0, i - 1))}
+                disabled={dupIndex === 0}
+                style={{
+                  background: "transparent",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius)",
+                  color: dupIndex === 0 ? "var(--text-tertiary)" : "var(--text-primary)",
+                  padding: "3px 10px",
+                  fontSize: 16,
+                  lineHeight: 1,
+                  cursor: dupIndex === 0 ? "default" : "pointer",
+                }}
+              >
+                ‹
+              </button>
+              <span className="mono" style={{
+                fontSize: 13,
+                color: "var(--text-secondary)",
+                minWidth: 42,
+                textAlign: "center",
+                margin: "0 10px",
+              }}>
+                {dupIndex + 1} / {duplicates.length}
+              </span>
+              <button
+                onClick={() => setDupIndex((i) => Math.min(duplicates.length - 1, i + 1))}
+                disabled={dupIndex === duplicates.length - 1}
+                style={{
+                  background: "transparent",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius)",
+                  color: dupIndex === duplicates.length - 1 ? "var(--text-tertiary)" : "var(--text-primary)",
+                  padding: "3px 10px",
+                  fontSize: 16,
+                  lineHeight: 1,
+                  cursor: dupIndex === duplicates.length - 1 ? "default" : "pointer",
+                }}
+              >
+                ›
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
+      {/* ── Panels ── */}
       <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
-        {/* Left pane: the file being kept */}
+        {/* Left: KEEP */}
         <div style={{ flex: 1, padding: 16, overflowY: "auto", borderRight: "1px solid var(--border)" }}>
           <FileCard
-            file={keepFile}
-            role="keep"
-            onSetKeep={() => {}}
-            isSelected={false}
-            onToggleSelect={() => {}}
+            file={keepFile} role="keep"
+            onSetKeep={() => {}} isSelected={false} onToggleSelect={() => {}}
+            previewDelay={0}
           />
         </div>
 
-        {/* Right pane: every other duplicate location */}
-        <div
-          style={{
-            flex: 1,
-            padding: 16,
-            overflowY: "auto",
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-          }}
-        >
-          {duplicates.map((f) => (
-            <FileCard
-              key={f.path}
-              file={f}
-              role="duplicate"
-              onSetKeep={() => onSetKeep(f.path)}
-              isSelected={selectedForDeletion.has(f.path)}
-              onToggleSelect={() => onToggleSelect(f.path)}
-            />
-          ))}
+        {/* Right: current DUPLICATE */}
+        <div style={{ flex: 1, padding: 16, overflowY: "auto" }}>
+          <FileCard
+            key={currentDup.path}
+            file={currentDup}
+            role="duplicate"
+            onSetKeep={() => onSetKeep(currentDup.path)}
+            isSelected={selectedForDeletion.has(currentDup.path)}
+            onToggleSelect={() => onToggleSelect(currentDup.path)}
+            previewDelay={200}
+          />
         </div>
       </div>
     </div>

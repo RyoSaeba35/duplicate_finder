@@ -24,6 +24,7 @@
 #if defined(_WIN32)
 #include <shellapi.h>
 #include <windows.h>
+#include <objbase.h>
 #elif defined(__APPLE__)
 #include <cstdlib>
 #include <sstream>
@@ -35,9 +36,55 @@ namespace fs = std::filesystem;
 
 #if defined(_WIN32)
 
+// Converts a UTF-8 std::string to a proper UTF-16 std::wstring using the
+// actual Windows conversion API. This matters: a naive per-byte widening
+// (copying each char directly into a wchar_t) only happens to work for
+// pure ASCII. Any real Unicode -- accented characters, typographic
+// punctuation like a curly apostrophe, anything outside ASCII -- is
+// multi-byte in UTF-8, and copying those bytes one-for-one into wide
+// characters produces garbage that doesn't correspond to the actual
+// filename at all. Confirmed directly: a file named with a French
+// accented character and a curly apostrophe failed to delete with
+// "file not found" (SHFileOperation error 2) purely because the naive
+// conversion corrupted the path before Windows ever saw it -- the file
+// existed the whole time, it just was never being asked for correctly.
+inline std::wstring utf8_to_wide(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                                            static_cast<int>(utf8.size()), nullptr, 0);
+    if (size_needed <= 0) return std::wstring();
+    std::wstring wide(static_cast<size_t>(size_needed), 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()),
+                         &wide[0], size_needed);
+    return wide;
+}
+
 inline bool move_to_trash(const std::string& path, std::string& error_out) {
-    // SHFileOperationW wants a double-null-terminated wide string.
-    std::wstring wpath(path.begin(), path.end());
+    // SHFileOperationW's FOF_ALLOWUNDO path uses COM internally (it's the
+    // Shell's own file-operation engine, the same one Explorer's Recycle
+    // Bin delete uses). httplib serves requests on a pool of worker
+    // threads that get reused across many requests -- if a thread was
+    // never CoInitialize'd, or was left in an inconsistent COM state from
+    // an earlier call, SHFileOperationW can hang indefinitely on a LATER
+    // call from that same reused thread, even though an earlier call
+    // from it worked fine (exactly the "first delete works, second one
+    // hangs" pattern this fixes). Since we can't control which thread
+    // httplib hands us or predict its COM history, we make no
+    // assumptions: initialize and clean up COM explicitly on every
+    // single call, treating each one as fully self-contained.
+    HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // S_OK: we initialized it fresh. S_FALSE: already initialized (on
+    // this thread) with the same threading model -- either way we now
+    // hold a reference and must release it with CoUninitialize.
+    // RPC_E_CHANGED_MODE means this thread already has COM initialized
+    // with a DIFFERENT threading model than we asked for; we did NOT
+    // add a new reference in that case, so we must NOT call
+    // CoUninitialize (that would wrongly decrement someone else's
+    // reference count) -- COM is still usable regardless, so we proceed
+    // with the operation either way.
+    bool we_hold_com_reference = (com_result == S_OK || com_result == S_FALSE);
+
+    std::wstring wpath = utf8_to_wide(path);
     wpath.push_back(L'\0');
     wpath.push_back(L'\0');
 
@@ -47,11 +94,16 @@ inline bool move_to_trash(const std::string& path, std::string& error_out) {
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
 
     int result = SHFileOperationW(&op);
-    if (result != 0 || op.fAnyOperationsAborted) {
+    bool ok = (result == 0 && !op.fAnyOperationsAborted);
+    if (!ok) {
         error_out = "SHFileOperation failed (code " + std::to_string(result) + ")";
-        return false;
     }
-    return true;
+
+    if (we_hold_com_reference) {
+        CoUninitialize();
+    }
+
+    return ok;
 }
 
 #elif defined(__APPLE__)

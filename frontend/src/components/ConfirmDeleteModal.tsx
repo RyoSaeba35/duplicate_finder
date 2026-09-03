@@ -1,4 +1,5 @@
 import { formatBytes } from "../api";
+import { useTranslation } from "../i18n/context";
 
 interface Props {
   fileCount: number;
@@ -9,6 +10,7 @@ interface Props {
 }
 
 export default function ConfirmDeleteModal({ fileCount, totalBytes, onConfirm, onCancel, busy }: Props) {
+  const { t } = useTranslation();
   return (
     <div
       role="dialog"
@@ -37,12 +39,10 @@ export default function ConfirmDeleteModal({ fileCount, totalBytes, onConfirm, o
         }}
       >
         <h2 id="confirm-delete-title" style={{ margin: "0 0 8px", fontSize: 15 }}>
-          Move {fileCount} file{fileCount > 1 ? "s" : ""} to Trash?
+          {t("confirmDeleteModal.title", { count: fileCount })}
         </h2>
         <p style={{ margin: "0 0 4px", fontSize: 12.5, color: "var(--text-secondary)", lineHeight: 1.5 }}>
-          This frees up <strong style={{ color: "var(--accent-teal)" }}>{formatBytes(totalBytes)}</strong>.
-          Files are moved to your system Trash / Recycle Bin, not permanently deleted — you can
-          restore them from there afterward.
+          {t("confirmDeleteModal.description", { size: formatBytes(totalBytes) })}
         </p>
 
         <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
@@ -58,7 +58,7 @@ export default function ConfirmDeleteModal({ fileCount, totalBytes, onConfirm, o
               padding: "9px 0",
             }}
           >
-            Cancel
+            {t("confirmDeleteModal.cancel")}
           </button>
           <button
             onClick={onConfirm}
@@ -74,7 +74,7 @@ export default function ConfirmDeleteModal({ fileCount, totalBytes, onConfirm, o
               padding: "9px 0",
             }}
           >
-            {busy ? "Moving…" : "Move to Trash"}
+            {busy ? t("confirmDeleteModal.moving") : t("confirmDeleteModal.moveToTrash")}
           </button>
         </div>
       </div>
