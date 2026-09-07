@@ -2,7 +2,7 @@ import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { activateLicense, getTrialStatus, TrialStatus } from "../api";
 import { useTranslation } from "../i18n/context";
 
-const BUY_URL = "https://pierrecode.gumroad.com/l/byzsj";
+const BUY_URL = "https://getduplicatefinder.app/buy";
 const FREE_MODE_SEEN_KEY = "dupfinder-freemode-seen";
 
 interface AppModeValue { isFreeMode: boolean; }

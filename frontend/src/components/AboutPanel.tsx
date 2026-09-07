@@ -8,10 +8,14 @@ const CREDITS: { name: string; license: string; url: string }[] = [
   { name: "SheetJS (via @e965/xlsx)", license: "Apache-2.0", url: "https://sheetjs.com" },
 ];
 
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.2";
 
 // What changed in this version — English only, one-time content.
 const CHANGELOG = [
+  "Photographer Mode — scan photo libraries, detect RAW+JPEG pairs, preview embedded RAW thumbnails",
+  "Lightroom catalog awareness — tracks and protects Lightroom-managed files",
+  "Smart C:\\ scan defaults — system, AppData, and dev folders excluded automatically",
+  "Smarter C:\\ scanning — system folders (Windows, Program Files, AppData), browser data, and dev tool caches (.cargo, .vscode, node_modules…) excluded automatically",
   "Free mode — scan forever, upgrade once to delete",
   "Bulk auto-select by rule (keep newest / oldest / shortest path)",
   "Review panel with inline file previews before deleting",

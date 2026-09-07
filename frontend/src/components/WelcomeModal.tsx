@@ -79,7 +79,7 @@ export default function WelcomeModal({ onClose }: Props) {
             {t("welcome.title")}
           </h2>
           <p style={{ margin: 0, fontSize: 13, color: "var(--text-tertiary)" }}>
-            Galerne Studio — v0.2.0
+            Galerne Studio — v0.3.2
           </p>
         </div>
 

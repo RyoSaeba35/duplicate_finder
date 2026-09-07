@@ -5,13 +5,16 @@ import { useAppMode } from "./LicenseGate";
 
 export type BulkRule = "newest" | "oldest" | "shortest";
 
-const BUY_URL = "https://pierrecode.gumroad.com/l/byzsj";
+const BUY_URL = "https://getduplicatefinder.app/buy";
 
 interface Props {
   groups: DuplicateGroup[];
   selectedHash: string | null;
   onSelect: (hash: string) => void;
   onBulkSelect: (rule: BulkRule) => void;
+  // true when anything is currently marked for deletion — toggles the button
+  hasSelection: boolean;
+  onDeselectAll: () => void;
   // Reports the current sorted+filtered hash order to App so keyboard
   // navigation stays in sync with what's visible in the sidebar.
   onSortedHashes?: (hashes: string[]) => void;
@@ -44,7 +47,8 @@ function exportCsv(groups: DuplicateGroup[]): void {
 }
 
 export default function GroupList({
-  groups, selectedHash, onSelect, onBulkSelect, onSortedHashes,
+  groups, selectedHash, onSelect, onBulkSelect,
+  hasSelection, onDeselectAll, onSortedHashes,
 }: Props) {
   const { t } = useTranslation();
   const { isFreeMode } = useAppMode();
@@ -143,13 +147,18 @@ export default function GroupList({
                 <option value="oldest">{t("groupList.ruleOldest")}</option>
                 <option value="shortest">{t("groupList.ruleShortest")}</option>
               </select>
-              <button onClick={() => onBulkSelect(bulkRule)} style={{
-                background: "var(--accent-teal)", border: "none",
-                borderRadius: "var(--radius)", color: "var(--bg-base)",
-                fontSize: 11, fontWeight: 700, padding: "4px 8px",
-                whiteSpace: "nowrap", flexShrink: 0,
-              }}>
-                {t("groupList.applyToAll")}
+              <button
+                onClick={() => hasSelection ? onDeselectAll() : onBulkSelect(bulkRule)}
+                style={{
+                  background: hasSelection ? "var(--bg-panel)" : "var(--accent-teal)",
+                  border: hasSelection ? "1px solid var(--border)" : "none",
+                  borderRadius: "var(--radius)",
+                  color: hasSelection ? "var(--text-secondary)" : "var(--bg-base)",
+                  fontSize: 11, fontWeight: 700, padding: "4px 8px",
+                  whiteSpace: "nowrap", flexShrink: 0,
+                }}
+              >
+                {hasSelection ? t("groupList.deselectAll") : t("groupList.applyToAll")}
               </button>
             </div>
           )}

@@ -38,6 +38,10 @@ pub struct ScanOptions {
     /// Empty = no filter, scan all extensions.
     #[serde(default)]
     pub extension_filter: Vec<String>,
+    /// Absolute folder paths to skip entirely during the walk.
+    /// Compared case-insensitively on Windows. Empty = no extra exclusions.
+    #[serde(default)]
+    pub excluded_folders: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,17 +92,50 @@ pub enum ScanEvent {
 
 fn is_system_folder_name(name: &str) -> bool {
     const NAMES: &[&str] = &[
+        // Core Windows system directories
         "windows", "programdata", "$recycle.bin",
         "system volume information", "recovery", "config.msi", "perflogs",
+        // Application install directories — contain app-managed files, not user files.
+        // Duplicates here (e.g. Edge DLLs across update folders, CMake versions) are
+        // intentional versioned copies that the app manages; users should never delete them.
+        "program files", "program files (x86)", "windowsapps",
+        // User app data — browser caches, SDK headers, Python packages, pip cache etc.
+        // Almost all duplicates here are noise: extension versions, NDK versions,
+        // site-packages installed in multiple locations. Legitimate user files live in
+        // Documents/Downloads/Desktop/Pictures, not AppData.
+        "appdata",
+        // Server / system tools — present on developer machines, never user files
+        "inetpub",  // IIS web server root
+        "drivers",  // device driver packages
     ];
     NAMES.contains(&name.to_lowercase().as_str())
 }
 
 fn is_dev_noise_folder_name(name: &str) -> bool {
     const NAMES: &[&str] = &[
-        "node_modules", ".git", ".svn", ".hg", "target", "build", "dist",
-        "bin", "obj", "__pycache__", ".venv", "venv", "vendor",
+        // Version control
+        ".git", ".svn", ".hg",
+        // Build output
+        "target", "build", "dist", "bin", "obj",
+        // Dependency installs
+        "node_modules", "vendor", ".venv", "venv",
+        // Package manager caches — identical files across projects/versions are
+        // intentional caching, not user-recoverable duplicates.
+        ".cargo",       // Rust: registry + compiled deps
+        ".npm",         // npm global cache
+        ".yarn",        // Yarn cache
+        ".pnpm-store",  // pnpm content-addressable store
+        ".m2",          // Maven local repository (jars duplicated across versions)
+        ".nuget",       // NuGet global package cache
+        ".android",     // Android SDK/AVD cache in home folder
+        "packages",     // NuGet packages folder inside .NET solutions
+        // Toolchain installs
+        ".rustup",      // Rust toolchain docs, stdlib, tools
+        ".vscode",      // VS Code extension files, typeshed stubs, etc.
+        // IDE/tool state
         ".idea", ".vs", ".gradle", ".next", ".cache",
+        // Python bytecode cache
+        "__pycache__",
     ];
     NAMES.contains(&name.to_lowercase().as_str())
 }
@@ -166,6 +203,17 @@ fn modified_unix(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// Returns true if `path` matches any of the user-defined excluded folders.
+/// Comparison is case-insensitive and normalises backslash/forward-slash so
+/// a path picked from the Windows dialog always matches regardless of separator.
+fn is_user_excluded(path: &Path, excluded: &[String]) -> bool {
+    if excluded.is_empty() { return false; }
+    let path_str = path.to_string_lossy().to_lowercase().replace('/', "\\");
+    excluded.iter().any(|excl| {
+        excl.to_lowercase().replace('/', "\\") == path_str
+    })
+}
+
 pub fn run_scan(
     root: String,
     min_size_bytes: u64,
@@ -222,7 +270,10 @@ pub fn run_scan(
             if entry.depth() > 0 {
                 let name = entry.file_name().to_string_lossy();
                 let mut skip = false;
-                if options.skip_system_folders && is_system_folder_name(&name) { skip = true; }
+                // User-defined exclusion list — checked first, full path match.
+                if !skip && is_user_excluded(path, &options.excluded_folders) { skip = true; }
+                // Built-in folder filters.
+                if !skip && options.skip_system_folders && is_system_folder_name(&name) { skip = true; }
                 if !skip && options.skip_dev_noise && is_dev_noise_folder_name(&name) { skip = true; }
                 if !skip && options.skip_hidden_system && has_hidden_or_system_attribute(path) { skip = true; }
                 if skip { it.skip_current_dir(); }

@@ -1,0 +1,11 @@
+{
+  "version": "0.3.5",
+  "notes": "Auto-update, in-app changelog, custom folder exclusion list",
+  "pub_date": "2026-09-07T00:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUNUNaR1dwWTNEYldROVg3RXhJR3IxdTNTVkZSWVg3YVNCVEFsb0NRa0U4dTFxSDArNVJMbUxydU9oZWVzQ1BnamxaelBXajF0eGh6YWJGaHV0YlBZZ2FuRjNjWkE2RkFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4Nzk0NDIxCWZpbGU6RHVwbGljYXRlIEZpbmRlcl8wLjMuNV94NjQtc2V0dXAubnNpcy56aXAKeUZPQk5raUdPSHRlQS9BT2JWR2tuUCtBMWRsM256MnpzUmIxbVpLTStBOXlHdzYyczVkNVFLNks0aGdZL1dhQU44R2paWVc5MmJoVEw4RWQ3K3dKQnc9PQo=",
+      "url": "https://github.com/RyoSaeba35/duplicate_finder/releases/download/v0.3.5/Duplicate.Finder_0.3.5_x64-setup.nsis.zip"
+    }
+  }
+}

@@ -1,7 +1,5 @@
 import { useRef } from "react";
 import { ScanProgress, ScanOptions, formatBytes } from "../api";
-import LanguageSwitcher from "./LanguageSwitcher";
-import SettingsPanel from "./SettingsPanel";
 import { useTranslation } from "../i18n/context";
 import type { TranslationKey } from "../i18n/locales/en";
 import { useState } from "react";
@@ -14,6 +12,23 @@ const MIN_SIZE_OPTIONS = [
   { value: 1024,  label: "1 MB" },
   { value: 10240, label: "10 MB" },
 ];
+
+const EXCLUDED_FOLDERS_KEY = "dupfinder-excluded-folders";
+
+function loadExcludedFolders(): string[] {
+  try {
+    const raw = window.localStorage.getItem(EXCLUDED_FOLDERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveExcludedFolders(folders: string[]) {
+  window.localStorage.setItem(EXCLUDED_FOLDERS_KEY, JSON.stringify(folders));
+}
 
 function parseExtensions(raw: string): string[] {
   return raw
@@ -70,15 +85,12 @@ export default function ScanControls({
   const [extFilterText, setExtFilterText] = useState(
     (scanOptions.extensionFilter ?? []).join(" ")
   );
+  const [excludedFolders, setExcludedFolders] = useState<string[]>(loadExcludedFolders);
   const { t } = useTranslation();
 
   // ── ETA tracking ────────────────────────────────────────────────────────────
-  // hashPhaseStartRef is set the first time we see candidates > 0 with
-  // files_hashed === 0 — that's the instant hashing begins. Rate and ETA
-  // are computed from that point on every render so they update live.
   const hashPhaseStartRef = useRef<number | null>(null);
 
-  // Capture the start of the hashing phase.
   if (
     progress?.status === "running" &&
     progress.candidates > 0 &&
@@ -88,12 +100,10 @@ export default function ScanControls({
     hashPhaseStartRef.current = Date.now();
   }
 
-  // Reset when a scan ends or a new one starts.
   if (!progress || progress.status !== "running") {
     hashPhaseStartRef.current = null;
   }
 
-  // Compute ETA — only once enough data exists (> 1s elapsed, > 0 hashed).
   let etaText: string | null = null;
   if (
     progress?.status === "running" &&
@@ -103,12 +113,11 @@ export default function ScanControls({
   ) {
     const elapsedSec = (Date.now() - hashPhaseStartRef.current) / 1000;
     if (elapsedSec > 1) {
-      const rate = progress.files_hashed / elapsedSec; // files per second
+      const rate = progress.files_hashed / elapsedSec;
       if (rate > 0) {
         const remainingSec = Math.round(
           (progress.candidates - progress.files_hashed) / rate
         );
-        // Only show when > 5s remaining to avoid flicker at the end.
         if (remainingSec > 5) {
           etaText = `${formatEta(remainingSec)} ${t("scanControls.etaRemaining")}`;
         }
@@ -120,6 +129,34 @@ export default function ScanControls({
     setExtFilterText(raw);
     onScanOptionsChange({ ...scanOptions, extensionFilter: parseExtensions(raw) });
   }
+
+  async function handleAddExcludedFolder() {
+    const selected = await pickFolder(t);
+    if (!selected) return;
+    if (excludedFolders.includes(selected)) return; // already in list
+    const next = [...excludedFolders, selected];
+    setExcludedFolders(next);
+    saveExcludedFolders(next);
+    onScanOptionsChange({ ...scanOptions, excludedFolders: next });
+  }
+
+  function handleRemoveExcludedFolder(folder: string) {
+    const next = excludedFolders.filter((f) => f !== folder);
+    setExcludedFolders(next);
+    saveExcludedFolders(next);
+    onScanOptionsChange({ ...scanOptions, excludedFolders: next });
+  }
+
+  const sectionLabelStyle: React.CSSProperties = {
+    fontSize: 12, color: "var(--text-tertiary)",
+    textTransform: "uppercase", letterSpacing: 0.4, fontWeight: 600,
+  };
+
+  const smallBtnStyle: React.CSSProperties = {
+    background: "var(--bg-panel)", border: "1px solid var(--border)",
+    borderRadius: "var(--radius)", color: "var(--text-secondary)",
+    padding: "3px 8px", fontSize: 11, cursor: "pointer", whiteSpace: "nowrap",
+  };
 
   return (
     <div style={{
@@ -180,8 +217,6 @@ export default function ScanControls({
             {t("scanControls.cancel")}
           </button>
         )}
-        <LanguageSwitcher />
-        <SettingsPanel />
       </div>
 
       {/* ── Second row ── */}
@@ -207,73 +242,142 @@ export default function ScanControls({
           }}
         >
           {optionsOpen ? t("scanControls.optionsOpen") : t("scanControls.optionsClosed")}
+          {excludedFolders.length > 0 && (
+            <span style={{
+              marginLeft: 6, background: "var(--accent-teal)",
+              color: "#08201e", borderRadius: 10,
+              fontSize: 10, fontWeight: 700,
+              padding: "1px 6px",
+            }}>
+              {excludedFolders.length}
+            </span>
+          )}
         </button>
       </div>
 
       {optionsOpen && (
         <div style={{
-          display: "flex", flexDirection: "column", gap: 8,
+          display: "flex", flexDirection: "column", gap: 12,
           background: "var(--bg-panel-raised)", border: "1px solid var(--border)",
-          borderRadius: "var(--radius)", padding: "10px 14px",
+          borderRadius: "var(--radius)", padding: "12px 14px",
         }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <input type="checkbox"
-              checked={scanOptions.skipHiddenSystem ?? true} disabled={scanning}
-              onChange={(e) => onScanOptionsChange({ ...scanOptions, skipHiddenSystem: e.target.checked })}
-            />
-            {t("scanControls.skipHiddenSystem")}
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <input type="checkbox"
-              checked={scanOptions.skipSystemFolders ?? true} disabled={scanning}
-              onChange={(e) => onScanOptionsChange({ ...scanOptions, skipSystemFolders: e.target.checked })}
-            />
-            {t("scanControls.skipSystemFolders")}
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <input type="checkbox"
-              checked={scanOptions.skipDevNoise ?? true} disabled={scanning}
-              onChange={(e) => onScanOptionsChange({ ...scanOptions, skipDevNoise: e.target.checked })}
-            />
-            {t("scanControls.skipDevNoise")}
-          </label>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <span style={{ color: "var(--text-primary)", whiteSpace: "nowrap" }}>
-              {t("scanControls.minSize")}
-            </span>
-            <select
-              value={minSizeKb} disabled={scanning}
-              onChange={(e) => onMinSizeKbChange(Number(e.target.value))}
-              style={{
-                background: "var(--bg-panel)", border: "1px solid var(--border)",
-                borderRadius: "var(--radius)", color: "var(--text-secondary)",
-                padding: "3px 6px", fontSize: 12,
-              }}
-            >
-              {MIN_SIZE_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
+          {/* ── Scan filters ── */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <span style={sectionLabelStyle}>Scan filters</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <input type="checkbox"
+                checked={scanOptions.skipHiddenSystem ?? true} disabled={scanning}
+                onChange={(e) => onScanOptionsChange({ ...scanOptions, skipHiddenSystem: e.target.checked })}
+              />
+              {t("scanControls.skipHiddenSystem")}
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <input type="checkbox"
+                checked={scanOptions.skipSystemFolders ?? true} disabled={scanning}
+                onChange={(e) => onScanOptionsChange({ ...scanOptions, skipSystemFolders: e.target.checked })}
+              />
+              {t("scanControls.skipSystemFolders")}
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <input type="checkbox"
+                checked={scanOptions.skipDevNoise ?? true} disabled={scanning}
+                onChange={(e) => onScanOptionsChange({ ...scanOptions, skipDevNoise: e.target.checked })}
+              />
+              {t("scanControls.skipDevNoise")}
+            </label>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <span style={{ color: "var(--text-primary)", whiteSpace: "nowrap" }}>
+                {t("scanControls.minSize")}
+              </span>
+              <select
+                value={minSizeKb} disabled={scanning}
+                onChange={(e) => onMinSizeKbChange(Number(e.target.value))}
+                style={{
+                  background: "var(--bg-panel)", border: "1px solid var(--border)",
+                  borderRadius: "var(--radius)", color: "var(--text-secondary)",
+                  padding: "3px 6px", fontSize: 12,
+                }}
+              >
+                {MIN_SIZE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <span style={{ color: "var(--text-primary)", whiteSpace: "nowrap" }}>
+                {t("scanControls.extensionFilter")}
+              </span>
+              <input
+                type="text"
+                value={extFilterText} disabled={scanning}
+                onChange={(e) => handleExtFilterChange(e.target.value)}
+                placeholder={t("scanControls.extensionFilterPlaceholder")}
+                className="mono"
+                style={{
+                  flex: 1, background: "var(--bg-panel)",
+                  border: "1px solid var(--border)", borderRadius: "var(--radius)",
+                  color: "var(--text-primary)", padding: "4px 8px", fontSize: 12,
+                }}
+              />
+            </div>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <span style={{ color: "var(--text-primary)", whiteSpace: "nowrap" }}>
-              {t("scanControls.extensionFilter")}
-            </span>
-            <input
-              type="text"
-              value={extFilterText} disabled={scanning}
-              onChange={(e) => handleExtFilterChange(e.target.value)}
-              placeholder={t("scanControls.extensionFilterPlaceholder")}
-              className="mono"
-              style={{
-                flex: 1, background: "var(--bg-panel)",
-                border: "1px solid var(--border)", borderRadius: "var(--radius)",
-                color: "var(--text-primary)", padding: "4px 8px", fontSize: 12,
-              }}
-            />
+          {/* ── Divider ── */}
+          <div style={{ height: 1, background: "var(--border)" }} />
+
+          {/* ── Excluded folders ── */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={sectionLabelStyle}>Excluded folders</span>
+              <button
+                onClick={handleAddExcludedFolder}
+                disabled={scanning}
+                style={smallBtnStyle}
+              >
+                + Add folder
+              </button>
+            </div>
+
+            {excludedFolders.length === 0 ? (
+              <span style={{ fontSize: 12, color: "var(--text-tertiary)", fontStyle: "italic" }}>
+                No folders excluded — all subfolders will be scanned.
+              </span>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {excludedFolders.map((folder) => (
+                  <div key={folder} style={{
+                    display: "flex", alignItems: "center", gap: 8,
+                    background: "var(--bg-panel)", border: "1px solid var(--border)",
+                    borderRadius: "var(--radius)", padding: "5px 8px",
+                  }}>
+                    <span className="mono" style={{
+                      flex: 1, fontSize: 11, color: "var(--text-secondary)",
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    }}>
+                      {folder}
+                    </span>
+                    <button
+                      onClick={() => handleRemoveExcludedFolder(folder)}
+                      disabled={scanning}
+                      title="Remove"
+                      style={{
+                        background: "transparent", border: "none",
+                        color: "var(--text-tertiary)", fontSize: 14,
+                        cursor: "pointer", padding: "0 2px", flexShrink: 0,
+                        lineHeight: 1,
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
+
         </div>
       )}
 
@@ -284,7 +388,6 @@ export default function ScanControls({
             display: "flex", justifyContent: "space-between",
             alignItems: "center", marginTop: 4,
           }}>
-            {/* Left: status + ETA */}
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
               <span className="mono" style={{
                 color: "var(--text-secondary)", fontSize: 13,
@@ -304,19 +407,12 @@ export default function ScanControls({
                   ? t("scanControls.error", { message: progress.error_message })
                   : t("scanControls.cancelled")}
               </span>
-
-              {/* ETA — shown once we have a meaningful estimate */}
               {etaText && (
-                <span className="mono" style={{
-                  fontSize: 12,
-                  color: "var(--text-tertiary)",
-                }}>
+                <span className="mono" style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
                   {etaText}
                 </span>
               )}
             </div>
-
-            {/* Right: marked counter + reclaimable */}
             <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
               {selectedCount > 0 && (
                 <span className="mono" style={{

@@ -5,7 +5,7 @@ import { useTranslation } from "../i18n/context";
 import { useAppMode } from "./LicenseGate";
 import type { TranslationKey } from "../i18n/locales/en";
 
-const BUY_URL = "https://pierrecode.gumroad.com/l/byzsj";
+const BUY_URL = "https://getduplicatefinder.app/buy";
 
 interface Props {
   group: DuplicateGroup | null;
@@ -48,6 +48,28 @@ async function openFile(
   }
   try {
     await openFn(path);
+  } catch (e) {
+    alert(t("splitView.couldNotOpenFile", { message: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+async function openFolder(
+  path: string,
+  t: (key: TranslationKey, params?: Record<string, string | number>) => string
+) {
+  // Derive the parent folder by stripping the filename.
+  // Handles both backslash (Windows) and forward-slash separators.
+  const sep = path.includes("\\") ? "\\" : "/";
+  const folderPath = path.substring(0, path.lastIndexOf(sep)) || path;
+  let openFn: (path: string) => Promise<void>;
+  try {
+    ({ open: openFn } = await import("@tauri-apps/api/shell"));
+  } catch {
+    alert(t("splitView.openFileOnlyInApp"));
+    return;
+  }
+  try {
+    await openFn(folderPath);
   } catch (e) {
     alert(t("splitView.couldNotOpenFile", { message: e instanceof Error ? e.message : String(e) }));
   }
@@ -195,34 +217,63 @@ function FileCard({
         )}
       </div>
 
-      {!previewReady || !previewUrl ? (
-        <PreviewPlaceholder />
-      ) : file.is_image && sizeOk ? (
-        <img src={previewUrl} alt={file.filename} style={{
-          width: "100%", height: PREVIEW_HEIGHT, objectFit: "contain",
-          borderRadius: "var(--radius)", background: "var(--bg-base)",
-        }} onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
-      ) : file.extension === ".pdf" && sizeOk ? (
-        <PdfPreview url={previewUrl} filename={file.filename} />
-      ) : file.is_text && sizeOk ? (
-        <div style={{ height: PREVIEW_HEIGHT }}><TextPreview url={previewUrl} extension={file.extension} /></div>
-      ) : file.is_docx && sizeOk ? (
-        <div style={{ height: PREVIEW_HEIGHT }}><DocxPreview url={previewUrl} /></div>
-      ) : file.is_xlsx && sizeOk ? (
-        <div style={{ height: PREVIEW_HEIGHT }}><XlsxPreview url={previewUrl} /></div>
-      ) : (
-        <div style={{
-          width: "100%", height: PREVIEW_HEIGHT, borderRadius: "var(--radius)",
-          background: "var(--bg-base)", display: "flex", alignItems: "center", justifyContent: "center",
-        }}>
-          <span className="mono" style={{
-            fontSize: 22, fontWeight: 700, letterSpacing: 1, color: "var(--text-tertiary)",
-            border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 18px",
+      <div style={{ position: "relative" }}>
+        {!previewReady || !previewUrl ? (
+          <PreviewPlaceholder />
+        ) : file.is_image && sizeOk ? (
+          <img src={previewUrl} alt={file.filename} style={{
+            width: "100%", height: PREVIEW_HEIGHT, objectFit: "contain",
+            borderRadius: "var(--radius)", background: "var(--bg-base)",
+            transition: "filter 0.2s ease",
+            filter: isSelected ? "grayscale(1) brightness(0.45)" : "none",
+          }} onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
+        ) : file.extension === ".pdf" && sizeOk ? (
+          <div style={{ filter: isSelected ? "grayscale(1) brightness(0.45)" : "none", transition: "filter 0.2s ease" }}>
+            <PdfPreview url={previewUrl} filename={file.filename} />
+          </div>
+        ) : file.is_text && sizeOk ? (
+          <div style={{ height: PREVIEW_HEIGHT, filter: isSelected ? "grayscale(1) brightness(0.45)" : "none", transition: "filter 0.2s ease" }}>
+            <TextPreview url={previewUrl} extension={file.extension} />
+          </div>
+        ) : file.is_docx && sizeOk ? (
+          <div style={{ height: PREVIEW_HEIGHT, filter: isSelected ? "grayscale(1) brightness(0.45)" : "none", transition: "filter 0.2s ease" }}>
+            <DocxPreview url={previewUrl} />
+          </div>
+        ) : file.is_xlsx && sizeOk ? (
+          <div style={{ height: PREVIEW_HEIGHT, filter: isSelected ? "grayscale(1) brightness(0.45)" : "none", transition: "filter 0.2s ease" }}>
+            <XlsxPreview url={previewUrl} />
+          </div>
+        ) : (
+          <div style={{
+            width: "100%", height: PREVIEW_HEIGHT, borderRadius: "var(--radius)",
+            background: "var(--bg-base)", display: "flex", alignItems: "center", justifyContent: "center",
+            filter: isSelected ? "grayscale(1) brightness(0.45)" : "none", transition: "filter 0.2s ease",
           }}>
-            {(file.extension || "file").replace(".", "").toUpperCase()}
-          </span>
-        </div>
-      )}
+            <span className="mono" style={{
+              fontSize: 22, fontWeight: 700, letterSpacing: 1, color: "var(--text-tertiary)",
+              border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 18px",
+            }}>
+              {(file.extension || "file").replace(".", "").toUpperCase()}
+            </span>
+          </div>
+        )}
+        {/* Overlay label when marked for trash */}
+        {isSelected && (
+          <div style={{
+            position: "absolute", inset: 0,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            pointerEvents: "none",
+          }}>
+            <span style={{
+              background: "rgba(220,50,50,0.85)", color: "#fff",
+              fontSize: 11, fontWeight: 700, letterSpacing: 1,
+              textTransform: "uppercase", borderRadius: 4, padding: "4px 10px",
+            }}>
+              🗑 Trash
+            </span>
+          </div>
+        )}
+      </div>
 
       <div style={{ fontSize: 15, fontWeight: 600, wordBreak: "break-word" }}>{file.filename}</div>
 
@@ -230,24 +281,30 @@ function FileCard({
         {file.path}
       </div>
 
-      <div style={{
-        display: "flex", justifyContent: "space-between", alignItems: "center",
-        fontSize: 13, color: "var(--text-secondary)", flexWrap: "wrap", gap: 8,
-      }}>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <span>{formatBytes(file.size_bytes)}</span>
-          {formatModifiedDate(file.modified_unix) && (
-            <span className="mono" style={{ color: "var(--text-tertiary)" }}>
-              {formatModifiedDate(file.modified_unix)}
-            </span>
-          )}
-          <button onClick={() => openFile(file.path, t)} style={{
-            background: "var(--bg-panel-raised)", border: "1px solid var(--border)",
-            borderRadius: "var(--radius)", color: "var(--accent-teal)", fontSize: 13, fontWeight: 600, padding: "6px 12px",
-          }}>
-            {t("splitView.openFile")}
-          </button>
-        </div>
+      {/* Metadata row — size and date */}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", fontSize: 13, color: "var(--text-secondary)" }}>
+        <span>{formatBytes(file.size_bytes)}</span>
+        {formatModifiedDate(file.modified_unix) && (
+          <span className="mono" style={{ color: "var(--text-tertiary)" }}>
+            {formatModifiedDate(file.modified_unix)}
+          </span>
+        )}
+      </div>
+
+      {/* Buttons row — always below metadata */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button onClick={() => openFolder(file.path, t)} style={{
+          background: "var(--bg-panel-raised)", border: "1px solid var(--border)",
+          borderRadius: "var(--radius)", color: "var(--text-secondary)", fontSize: 13, fontWeight: 600, padding: "6px 12px",
+        }}>
+          {t("splitView.openFolder")}
+        </button>
+        <button onClick={() => openFile(file.path, t)} style={{
+          background: "var(--bg-panel-raised)", border: "1px solid var(--border)",
+          borderRadius: "var(--radius)", color: "var(--accent-teal)", fontSize: 13, fontWeight: 600, padding: "6px 12px",
+        }}>
+          {t("splitView.openFile")}
+        </button>
         {role === "duplicate" && !isFreeMode && (
           <button onClick={onSetKeep} style={{
             background: "var(--bg-panel-raised)", border: "1px solid var(--border)",

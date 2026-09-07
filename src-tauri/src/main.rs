@@ -19,6 +19,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod license;
+mod lightroom;
+mod photo_scanner;
+mod raw_preview;
 mod scanner;
 mod trial;
 
@@ -132,7 +135,7 @@ fn delete_files(paths: Vec<String>) -> Result<Vec<DeleteResult>, String> {
             .map(|path| DeleteResult {
                 path,
                 deleted: false,
-                error: Some("deletion requires a license — upgrade at pierrecode.gumroad.com/l/byzsj".to_string()),
+                error: Some("deletion requires a license — upgrade at gumroad.com/l/byzsj".to_string()),
             })
             .collect());
     }
@@ -155,6 +158,60 @@ fn delete_files(paths: Vec<String>) -> Result<Vec<DeleteResult>, String> {
     Ok(results)
 }
 
+
+#[tauri::command]
+fn start_photo_scan(
+    app: tauri::AppHandle,
+    scan_state: tauri::State<'_, ScanState>,
+    path: String,
+    lightroom_catalog: Option<String>,
+) -> Result<(), String> {
+    // Reset the shared cancel flag — photo scans share the same flag as
+    // general scans since only one scan runs at a time.
+    scan_state.0.store(false, Ordering::Relaxed);
+    let cancel = scan_state.0.clone();
+    let app_handle = app.clone();
+
+    std::thread::spawn(move || {
+        photo_scanner::run_photo_scan(
+            path,
+            lightroom_catalog,
+            cancel,
+            |event| {
+                let _ = app_handle.emit_all("photo-scan-event", &event);
+            },
+        );
+        let _ = app_handle.emit_all("photo-scan-terminated", ());
+    });
+
+    Ok(())
+}
+
+/// Validates a Lightroom catalog path and returns the number of tracked files,
+/// or an error string. Called by the frontend when the user picks a .lrcat file
+/// to give immediate feedback ("Catalog loaded — 12,345 files tracked").
+#[derive(serde::Serialize)]
+struct LightroomCatalogInfo {
+    tracked_count: usize,
+}
+
+#[tauri::command]
+fn validate_lightroom_catalog(path: String) -> Result<LightroomCatalogInfo, String> {
+    let paths = lightroom::read_tracked_paths(&path)?;
+    Ok(LightroomCatalogInfo { tracked_count: paths.len() })
+}
+
+
+/// Extracts the largest embedded JPEG preview from a RAW camera file and
+/// returns it as a base64 string the frontend can use as a data: URI.
+/// Returns null if no preview found (frontend falls back to extension badge).
+#[tauri::command]
+fn get_raw_thumbnail(path: String) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose};
+    let bytes = raw_preview::extract_jpeg_preview(&path)?;
+    Some(general_purpose::STANDARD.encode(&bytes))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(ScanState(Arc::new(AtomicBool::new(false))))
@@ -164,6 +221,9 @@ fn main() {
             trial_status,
             activate_license,
             delete_files,
+            start_photo_scan,
+            validate_lightroom_catalog,
+            get_raw_thumbnail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,3 +1,0 @@
-C:/Users/Jazz/dev/duplicate_finder/backend/build/CMakeFiles/dupfinder_backend.dir
-C:/Users/Jazz/dev/duplicate_finder/backend/build/CMakeFiles/ALL_BUILD.dir
-C:/Users/Jazz/dev/duplicate_finder/backend/build/CMakeFiles/ZERO_CHECK.dir

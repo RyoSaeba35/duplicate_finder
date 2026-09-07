@@ -42,6 +42,7 @@ export interface ScanOptions {
   /// Only hash files with these extensions e.g. [".jpg", ".pdf"].
   /// Empty array = no filter, all extensions are scanned.
   extensionFilter?: string[];
+  excludedFolders?: string[];
 }
 
 export async function startScan(

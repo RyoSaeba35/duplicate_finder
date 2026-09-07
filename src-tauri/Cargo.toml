@@ -1,6 +1,6 @@
 [package]
 name = "dup-finder"
-version = "0.2.0"
+version = "0.3.2"
 description = "Duplicate file finder — Rust scan engine, React UI"
 edition = "2021"
 
@@ -8,7 +8,7 @@ edition = "2021"
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [ "protocol-asset", "shell-open", "dialog-open", "devtools"] }
+tauri = { version = "1", features = [ "process-relaunch", "updater", "protocol-asset", "shell-open", "dialog-open", "devtools"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -18,9 +18,14 @@ walkdir = "2"
 ureq = { version = "2", features = ["json"] }
 
 # Parallel hashing — distributes SHA-256 work across all CPU cores.
-# The hashing pass is the bottleneck on large drives; rayon's work-stealing
-# thread pool handles it with no manual thread management needed.
 rayon = "1"
+
+# Base64 encoding for RAW thumbnail data returned to the frontend.
+base64 = "0.21"
+
+# Lightroom catalog (.lrcat) is a SQLite database. rusqlite with bundled
+# compiles SQLite from source using cc — no system SQLite required on Windows.
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -5,7 +5,7 @@ import ConfirmDeleteModal from "./ConfirmDeleteModal";
 import { useTranslation } from "../i18n/context";
 import { useAppMode } from "./LicenseGate";
 
-const BUY_URL = "https://pierrecode.gumroad.com/l/byzsj";
+const BUY_URL = "https://getduplicatefinder.app/buy";
 const PREVIEW_HEIGHT = 300;
 
 function usePreviewUrl(path: string): string | null {
