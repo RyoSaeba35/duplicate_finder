@@ -6,3 +6,4 @@ dist/
 *.msix
 *.msixbundle
 src-tauri/target/
+frontend/node_modules/
